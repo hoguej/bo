@@ -1,0 +1,33 @@
+{
+  "name": "bo",
+  "version": "0.1.0",
+  "description": "AI wrapper around iMessage — get, send, react",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "get-messages": "bun run src/cli.ts get-messages",
+    "send-self": "bun run src/cli.ts send-self",
+    "list-chats": "bun run src/cli.ts list-chats",
+    "react": "bun run src/cli.ts react",
+    "watch-self": "bun run src/cli.ts watch-self",
+    "remember": "bun run src/cli.ts remember",
+    "forget": "bun run src/cli.ts forget",
+    "facts": "bun run src/cli.ts facts",
+    "skills": "bun run src/cli.ts skills"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^25.1.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@photon-ai/imessage-kit": "^2.1.0",
+    "openai": "^6.17.0"
+  },
+  "bin": {
+    "bo": "src/cli.ts"
+  }
+}

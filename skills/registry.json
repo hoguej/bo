@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "weather.tomorrow",
+      "name": "Tomorrow weather (NWS)",
+      "description": "Fetch tomorrow's forecast from weather.gov (NWS) for a ZIP code and return a concise summary string.",
+      "entrypoint": "scripts/skills/weather.tomorrow.ts",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "zip": { "type": "string", "description": "US ZIP code (5 digits). If omitted, BO_DEFAULT_ZIP is used." }
+        }
+      }
+    }
+  ]
+}
+
