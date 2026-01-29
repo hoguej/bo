@@ -1,0 +1,61 @@
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+.env.local
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and temp
+*.log
+logs/
+tmp/
+temp/
+.cache/
+
+# Build / coverage
+coverage/
+.nyc_output/
+*.lcov
+.next/
+.nuxt/
+out/
+*.tsbuildinfo
+
+# Misc
+*.bak
+*.tmp
