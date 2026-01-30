@@ -78,6 +78,42 @@ Or in Cursor: **Settings → Features → MCP → Add New MCP Server** and add P
 
 That first interactive run can establish the MCP connection so later headless runs from the script can use Playwright.
 
+## Daemon and watchdog (macOS)
+
+To run `watch-self` in the background and have it restart if it crashes or at login, use the wrapper script and **launchd** (macOS’s built-in daemon manager and watchdog).
+
+1. **Wrapper script** — `scripts/watch-self-daemon.sh` runs from the project root, loads `.env.local`, and runs `npm run watch-self`. Make it executable:
+
+   ```bash
+   chmod +x scripts/watch-self-daemon.sh
+   ```
+
+2. **launchd plist** — Copy `scripts/com.bo.watch-self.plist` to `~/Library/LaunchAgents/` and **edit the paths** inside (replace `/Users/hoguej/dev/bo` with your project path):
+
+   ```bash
+   mkdir -p ~/Library/LaunchAgents
+   cp scripts/com.bo.watch-self.plist ~/Library/LaunchAgents/
+   # Edit ~/Library/LaunchAgents/com.bo.watch-self.plist: set WorkingDirectory, ProgramArguments, StandardOutPath, StandardErrorPath to your project path
+   ```
+
+3. **Load (start) the daemon:**
+
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.bo.watch-self.plist
+   ```
+
+4. **Unload (stop):**
+
+   ```bash
+   launchctl unload ~/Library/LaunchAgents/com.bo.watch-self.plist
+   ```
+
+5. **Logs** — stdout and stderr go to `logs/watch-self.out.log` and `logs/watch-self.err.log` (created on first run).
+
+**Built-in watchdog:** launchd’s **KeepAlive** (set to `true` in the plist) makes macOS restart the job if it exits for any reason. **RunAtLoad** starts it at login. So the watcher runs as a daemon and is restarted automatically on crash or reboot.
+
+**Note:** The process runs under your user; give **Full Disk Access** to the app that runs the script (e.g. Terminal, or the shell used by launchd). If you run the plist from a login shell, your `PATH` and env may differ; the plist sets a minimal `PATH`; for `bun`/`npm` ensure they’re in that path (e.g. `/opt/homebrew/bin`) or set `PATH` in the plist’s `EnvironmentVariables` to include your bun location.
+
 ## Examples
 
 ```bash

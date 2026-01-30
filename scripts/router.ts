@@ -1,15 +1,43 @@
 import OpenAI from "openai";
 import { spawn } from "node:child_process";
-import { formatFactsForPrompt, getAllFacts, getMemoryPathForOwner, getRelevantFacts, normalizeOwner, upsertFact } from "../src/memory";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import {
+  appendConversation,
+  appendPersonalityInstruction,
+  appendSummarySentence,
+  formatConversationForPrompt,
+  formatFactsForPrompt,
+  formatInferencesForPrompt,
+  getAllFacts,
+  getAllInferences,
+  getMemoryPathForOwner,
+  getMaxConversationMessages,
+  getPersonalityForPrompt,
+  getRecentMessages,
+  getRelevantFacts,
+  getRelevantInferences,
+  getSummaryForPrompt,
+  normalizeOwner,
+  upsertFact,
+  upsertInference,
+} from "../src/memory";
 import { getSkillById, loadSkillsRegistry } from "../src/skills";
 
 type FactInput = { key: string; value: string; scope?: "user" | "global"; tags?: string[] };
+
+type InferenceInput = { key: string; value: string; basedOnKeys?: string[] };
 
 type RouterDecision = {
   action: "use_skill" | "respond";
   skill_id?: string;
   skill_input?: Record<string, unknown>;
   save_facts?: FactInput[];
+  save_inferences?: InferenceInput[];
+  summary_sentence?: string;
+  personality_instruction?: string;
+  conversation_starter?: string;
   response_text?: string;
 };
 
@@ -29,6 +57,56 @@ function logBlock(title: string, body: string) {
   console.error(`\n[bo router] ${title}\n${body}\n`);
 }
 
+/** Log request and response to a file so you can inspect them (default ~/.bo/router.log, or BO_ROUTER_LOG). */
+function logRequestResponseToFile(requestDoc: unknown, rawResponse: string) {
+  const logPath = getEnv("BO_ROUTER_LOG") ?? join(homedir(), ".bo", "router.log");
+  try {
+    const dir = dirname(logPath);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const block = [
+      "",
+      "---",
+      new Date().toISOString(),
+      "REQUEST:",
+      JSON.stringify(requestDoc, null, 2),
+      "RESPONSE:",
+      rawResponse || "(empty)",
+      "",
+    ].join("\n");
+    appendFileSync(logPath, block, "utf-8");
+  } catch (e) {
+    console.error("[bo router] Failed to write log file:", e instanceof Error ? e.message : String(e));
+  }
+}
+
+/** Polite nonsense excuses when something goes wrong. Never send raw errors or JSON to the user. */
+const EXCUSES_ON_ERROR = [
+  "Oh, you silly.",
+  "My brain short-circuited. One sec.",
+  "I got distracted by a butterfly. Try again?",
+  "That one went over my head. Say it again?",
+  "I blinked and missed it. One more time?",
+  "My wires crossed. Hit me again?",
+  "I was busy daydreaming. What was that?",
+  "Oops—slipped my mind. Again?",
+  "I think I glitched. One more?",
+  "Lost in the clouds. Try again?",
+  "My hamster fell off the wheel. Go on?",
+  "I zoned out for a sec. What did you say?",
+  "Something shiny caught my eye. Say that again?",
+  "I had a brief existential moment. Try again?",
+  "My crystal ball fogged up. One more time?",
+  "I was briefly not here. Again?",
+  "My ears (metaphorically) need a second. Go on?",
+  "I think I blacked out. What was that?",
+  "The gremlins are at it again. Hit me once more?",
+  "I forgot how to words for a sec. Try again?",
+];
+
+function randomExcuse(): string {
+  return EXCUSES_ON_ERROR[Math.floor(Math.random() * EXCUSES_ON_ERROR.length)]!;
+}
+
 function buildContext() {
   return {
     channel: "imessage",
@@ -36,6 +114,7 @@ function buildContext() {
     to: getEnv("BO_REQUEST_TO"),
     isSelfChat: getEnv("BO_REQUEST_IS_SELF_CHAT"),
     isFromMe: getEnv("BO_REQUEST_IS_FROM_ME"),
+    default_zip: getEnv("BO_DEFAULT_ZIP") || undefined,
   };
 }
 
@@ -63,6 +142,43 @@ function normalizeDecision(raw: unknown): RouterDecision {
   return d as RouterDecision;
 }
 
+/** Rephrase raw skill output in Bo's personality before sending to the user. Falls back to raw if LLM fails. */
+async function rephraseSkillOutputForUser(
+  openai: OpenAI,
+  model: string,
+  skillStdout: string,
+  userMessage: string
+): Promise<string> {
+  const system =
+    "You are Bo, an iMessage assistant. Be witty, playful, and encouraging. The user asked something that was answered by a local skill. Your job is to give that information back to the user in your own personality. Return a SINGLE JSON object with only one key: response_text (your reply to the user). Keep it concise (iMessage length). Do not repeat raw data verbatim—rephrase it in a friendly, Bo way.";
+  const userPayload = [
+    "Raw output from the skill:",
+    skillStdout,
+    "",
+    "Original user message:",
+    userMessage,
+  ].join("\n");
+  try {
+    const completion = await openai.chat.completions.create({
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: userPayload },
+      ],
+      temperature: 0.3,
+      stream: false,
+    });
+    const raw = completion.choices[0]?.message?.content?.trim() ?? "";
+    const jsonStr = extractJsonObject(raw) ?? raw;
+    const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
+    const text = parsed?.response_text;
+    if (typeof text === "string" && text.trim()) return text.trim();
+  } catch (e) {
+    console.error("[bo router] Rephrase skill output failed:", e instanceof Error ? e.message : String(e));
+  }
+  return skillStdout;
+}
+
 async function callSkill(entrypoint: string, input: Record<string, unknown>): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
     const proc = spawn("bun", ["run", entrypoint], {
@@ -85,15 +201,17 @@ async function main() {
 
   const apiKey = getEnv("AI_GATEWAY_API_KEY") ?? getEnv("VERCEL_OIDC_TOKEN");
   if (!apiKey) {
-    console.error("Missing AI Gateway auth. Set AI_GATEWAY_API_KEY (recommended) or VERCEL_OIDC_TOKEN.");
-    process.exit(1);
+    console.error("[bo router] Missing AI Gateway auth. Set AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN.");
+    process.stdout.write(randomExcuse());
+    process.exit(0);
   }
   const model = getEnv("BO_LLM_MODEL") ?? "openai/gpt-4.1";
 
   const userMessage = process.argv.slice(2).join(" ").trim();
   if (!userMessage) {
-    console.error("Usage: bun run scripts/router.ts \"message...\"");
-    process.exit(1);
+    console.error("[bo router] No message provided.");
+    process.stdout.write(randomExcuse());
+    process.exit(0);
   }
 
   const registry = loadSkillsRegistry();
@@ -106,37 +224,55 @@ async function main() {
   const owner = isSelfChat && isFromMe ? "default" : normalizeOwner(fromRaw);
   const memoryPath = getMemoryPathForOwner(owner);
 
-  // For "what do you know about me?" pass all facts; otherwise relevant subset.
+  // For "what do you know about me?" pass all facts and inferences; otherwise relevant subset.
   const askingAboutMe = /what do you know|what (info|facts?) do you have|what do you have on me|tell me what you know about me|list (what you know|your facts)/i.test(userMessage);
   const facts = askingAboutMe ? getAllFacts({ path: memoryPath }) : getRelevantFacts(userMessage, { max: 12, path: memoryPath });
+  const inferences = askingAboutMe ? getAllInferences({ path: memoryPath }) : getRelevantInferences(userMessage, { max: 12, path: memoryPath });
   const factsBlock = formatFactsForPrompt(facts);
+  const inferencesBlock = formatInferencesForPrompt(inferences);
+
+  // Last N-1 messages so current user message fits; we keep up to BO_CONVERSATION_MESSAGES (default 20) total.
+  const maxMessages = getMaxConversationMessages();
+  const recentMessages = getRecentMessages(owner, maxMessages - 1);
+  const conversationBlock = formatConversationForPrompt(recentMessages);
 
   const system = [
     "You are Bo, an iMessage assistant.",
+    "Personality: Be witty, playful, and engaging. Always try to compliment, encourage, or flatter the user—weave it in naturally (e.g. 'good question', 'love that', 'you're on fire'). Your response_text should feel like a sharp, friendly text from a clever friend—light humor when it fits, a bit of sass when appropriate, never dull or corporate. Keep it concise (iMessage length) but with personality.",
+    "",
     "You must return a SINGLE JSON object with no extra text.",
+    "",
+    "Facts vs inferences: Facts are what the user explicitly stated. Inferences are things you derive from facts (e.g. 'my children are Cara and Robert' → fact; infer 'number of children: 2', 'Cara is female', 'Robert is male'). Store both: save_facts for explicit statements, save_inferences for derived conclusions. Use basedOnKeys in save_inferences to list fact keys the inference came from when relevant.",
+    "",
+    "Remember everything relevant about the user and their context. Save not only direct facts about the user (name, email, location) but any new information about their life: family members, ages (e.g. 'my kids are 9 and 16' → save children_ages or Cara_age, Robert_age), relationships, preferences, work, pets, where they live, etc. Use save_facts for what they stated (e.g. children_ages: '9 and 16', or Cara_age: 9, Robert_age: 16) and save_inferences for what you derive. This context is important for later replies.",
     "",
     "Decide whether to use a local skill (script) or respond normally.",
     "Prefer using a local skill when it can answer the user request more reliably than a general response (e.g. weather).",
     "",
-    "If the user asks what you know about them (e.g. 'what do you know about me?'): use action=respond and in response_text list each known user fact from the payload above (key: value). If there are none, say you don't have any stored facts yet.",
+    "Weather: For weather.tomorrow, use the user's ZIP from facts (e.g. home_zip, zip, or location that implies one) or context.default_zip. Do not ask the user for their ZIP if we have a default or a stored location—call the skill with that zip (or omit zip to use default).",
     "",
-    "If the user asks what you can do or your capabilities (e.g. 'what can you do?'): use action=respond and in response_text list each local skill by name and a one-line description from the registry, then add that you can also answer general questions.",
+    "If the user asks what you know about them: use action=respond and list both Facts and Inferences from the payload. If there are none, say you don't have any stored yet.",
     "",
-    "If the user asks for a specific fact about them (e.g. 'what's my name?', 'where do I live?', 'what's my email?'): use action=respond and answer only from the Known user facts in the payload. Give a short, direct answer. If we don't have that fact stored, say you don't have it yet.",
+    "If the user asks what you can do or your capabilities: use action=respond and list each local skill by name and a one-line description, then add that you can also answer general questions.",
     "",
-    "If using a local skill:",
-    '- action="use_skill"',
-    "- Choose skill_id from the provided registry",
-    "- Provide skill_input with only the parameters needed by that skill",
+    "If the user asks for a specific fact about them: use action=respond and answer from Facts and Inferences in the payload. Give a short, direct answer. If we don't have it, say you don't have it yet.",
     "",
-    "If responding normally (other questions):",
-    '- action="respond"',
-    "- Provide response_text (what to send back to the user)",
+    "If using a local skill: action=use_skill, skill_id from registry, skill_input with only needed parameters.",
+    "If responding normally: action=respond, response_text (what to send back).",
     "",
-    "Also: if the user states durable personal info (name/email/location/etc.), include it in save_facts as {key,value,scope?,tags?}.",
-    "Never invent facts.",
+    "When the user states any personal or contextual info (about themselves, family, ages, relationships, preferences, life details): add to save_facts as {key, value, scope?, tags?}. When you infer something from facts (e.g. count, gender from name, ages): add to save_inferences as {key, value, basedOnKeys?}. Never invent facts; inferences must follow from stated facts.",
+    "",
+    "CRITICAL: Your response must be a single JSON object. It MUST always include 'action' (either 'use_skill' or 'respond'). If you are only saving facts/inferences with no other reply, use action='respond' and set response_text to a short acknowledgment (e.g. 'Got it, I've noted that.'). Never omit action.",
+    "",
+    "Optional: To improve long-term memory without expanding context, you may add summary_sentence: one short sentence summarizing this exchange for prior-context (e.g. 'User shared that Cara is 9.' or 'User asked about weather for 43130.'). We append it to a running summary. Only include when the exchange adds notable context.",
+    "",
+    "Optional: Add conversation_starter only when the exchange feels boring or redundant—e.g. short one-off answers, repeated topics, or when there's little to build on. A short follow-up (e.g. 'Want to hear a joke?', 'How are you feeling today?', 'What was the best part of your day?') can re-engage. Do not add it when the user just shared something substantive or the conversation is already engaging.",
+    "",
+    "Personality direction: If the user tells you how Bo should behave or sound (e.g. 'be more macho', 'talk like a pirate'), set personality_instruction (top-level) to only the NEW instruction from this message—one short phrase. Do not put it in save_facts. Do not return the full list of past instructions; we store and accumulate them. Acknowledge in response_text (e.g. 'Got it, I'll keep that in mind.').",
   ].join("\n");
 
+  const summaryBlock = getSummaryForPrompt(owner);
+  const personalityBlock = getPersonalityForPrompt(owner);
   const skillsSummary = registry.skills.map((s) => ({
     id: s.id,
     name: s.name,
@@ -148,8 +284,13 @@ async function main() {
     "Context:",
     JSON.stringify(context),
     "",
-    factsBlock ? factsBlock : "Known user facts: (none)",
+    factsBlock || "Facts: (none)",
     "",
+    inferencesBlock || "Inferences: (none)",
+    "",
+    personalityBlock ? `Personality directions for this user (follow these): ${personalityBlock}\n` : "",
+    summaryBlock ? `Conversation summary (prior context):\n${summaryBlock}\n\n` : "",
+    conversationBlock ? conversationBlock + "\n" : "",
     "Local skills registry (choose from these only):",
     JSON.stringify(skillsSummary),
     "",
@@ -157,14 +298,14 @@ async function main() {
     userMessage,
   ].join("\n");
 
+  const requestDoc = {
+    model,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: userPayload },
+    ],
+  };
   if (debug) {
-    const requestDoc = {
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: userPayload },
-      ],
-    };
     logBlock("request", JSON.stringify(requestDoc, null, 2));
   }
 
@@ -180,17 +321,53 @@ async function main() {
   });
 
   const rawText = completion.choices[0]?.message?.content?.trim() ?? "";
+  // Always log request/response to file so you can inspect them (~/.bo/router.log or BO_ROUTER_LOG).
+  logRequestResponseToFile(requestDoc, rawText);
   if (debug) {
     logBlock("raw response", rawText || "(empty)");
   }
   const jsonText = extractJsonObject(rawText) ?? rawText;
   let decision: RouterDecision;
   try {
-    decision = normalizeDecision(JSON.parse(jsonText));
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    decision = normalizeDecision(parsed);
   } catch (e) {
-    console.error("Router JSON parse failed.");
-    console.error(rawText);
-    throw e;
+    // Log only; never send error or JSON to the user.
+    console.error("[bo router] Router JSON parse or validation failed.");
+    console.error("[bo router] Error:", e instanceof Error ? e.message : String(e));
+    console.error("[bo router] Raw response:", rawText);
+
+    // If we got valid save_facts/save_inferences but missing action, save them and acknowledge.
+    try {
+      const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+      const saveFacts = Array.isArray(parsed.save_facts) ? parsed.save_facts : [];
+      const saveInferences = Array.isArray(parsed.save_inferences) ? parsed.save_inferences : [];
+      if (saveFacts.length > 0 || saveInferences.length > 0) {
+        for (const f of saveFacts) {
+          if (f && typeof f.key === "string" && typeof f.value === "string") {
+            if ((f as FactInput).key.toLowerCase() === "personality_instruction") {
+              appendPersonalityInstruction(owner, (f as FactInput).value);
+              continue;
+            }
+            upsertFact({ key: f.key, value: f.value, scope: (f as FactInput).scope ?? "user", tags: (f as FactInput).tags ?? [], path: memoryPath });
+          }
+        }
+        for (const i of saveInferences) {
+          if (i && typeof (i as InferenceInput).key === "string" && typeof (i as InferenceInput).value === "string") {
+            upsertInference({ key: (i as InferenceInput).key, value: (i as InferenceInput).value, basedOnKeys: (i as InferenceInput).basedOnKeys, path: memoryPath });
+          }
+        }
+        process.stdout.write("Got it, I've noted that.");
+        appendConversation(owner, userMessage, "Got it, I've noted that.");
+        return;
+      }
+    } catch (_) {
+      // ignore
+    }
+    const excuse = randomExcuse();
+    process.stdout.write(excuse);
+    appendConversation(owner, userMessage, excuse);
+    return;
   }
 
   // Always log the parsed decision + next step (stderr), since it's useful while iterating.
@@ -199,46 +376,81 @@ async function main() {
       (decision.action === "use_skill" ? ` skill_id=${decision.skill_id ?? "(missing)"}` : "")
   );
 
-  const toSave = Array.isArray(decision.save_facts) ? decision.save_facts : [];
-  for (const f of toSave) {
+  const toSaveFacts = Array.isArray(decision.save_facts) ? decision.save_facts : [];
+  for (const f of toSaveFacts) {
     if (!f || typeof f.key !== "string" || typeof f.value !== "string") continue;
+    if (f.key.toLowerCase() === "personality_instruction") {
+      appendPersonalityInstruction(owner, f.value);
+      continue;
+    }
     upsertFact({ key: f.key, value: f.value, scope: f.scope ?? "user", tags: f.tags ?? [], path: memoryPath });
   }
-  if (debug && toSave.length) {
-    logBlock("saved facts", JSON.stringify(toSave, null, 2));
+  if (debug && toSaveFacts.length) logBlock("saved facts", JSON.stringify(toSaveFacts, null, 2));
+
+  const toSaveInferences = Array.isArray(decision.save_inferences) ? decision.save_inferences : [];
+  for (const i of toSaveInferences) {
+    if (!i || typeof i.key !== "string" || typeof i.value !== "string") continue;
+    upsertInference({ key: i.key, value: i.value, basedOnKeys: i.basedOnKeys, path: memoryPath });
   }
+  if (debug && toSaveInferences.length) logBlock("saved inferences", JSON.stringify(toSaveInferences, null, 2));
+
+  if (decision.summary_sentence && typeof decision.summary_sentence === "string" && decision.summary_sentence.trim()) {
+    appendSummarySentence(owner, decision.summary_sentence.trim());
+  }
+
+  if (decision.personality_instruction && typeof decision.personality_instruction === "string" && decision.personality_instruction.trim()) {
+    appendPersonalityInstruction(owner, decision.personality_instruction.trim());
+  }
+
+  let finalReply: string;
 
   if (decision.action === "respond") {
     console.error("[bo router] next: return response_text");
-    const text = (decision.response_text ?? "").trim();
-    process.stdout.write(text || "Done.");
-    return;
+    finalReply = (decision.response_text ?? "").trim() || "Done.";
+  } else {
+    const skillId = decision.skill_id;
+    if (!skillId) {
+      console.error("[bo router] Decision missing skill_id");
+      const excuse = randomExcuse();
+      process.stdout.write(excuse);
+      appendConversation(owner, userMessage, excuse);
+      return;
+    }
+    const skill = getSkillById(skillId);
+    if (!skill) {
+      console.error(`[bo router] Unknown skill_id: ${skillId}`);
+      const excuse = randomExcuse();
+      process.stdout.write(excuse);
+      appendConversation(owner, userMessage, excuse);
+      return;
+    }
+    const input = (decision.skill_input ?? {}) as Record<string, unknown>;
+    console.error(`[bo router] next: run skill ${skill.id} (${skill.entrypoint})`);
+    if (debug) logBlock("skill input", JSON.stringify(input, null, 2));
+    const { stdout, stderr, code } = await callSkill(skill.entrypoint, input);
+    if (code !== 0) {
+      console.error("[bo router] Skill failed:", code, stderr || "(no stderr)");
+      finalReply = randomExcuse();
+      process.stdout.write(finalReply);
+      appendConversation(owner, userMessage, finalReply);
+      return;
+    }
+    const rawSkillOutput = stdout || "Done.";
+    finalReply = await rephraseSkillOutputForUser(openai, model, rawSkillOutput, userMessage);
   }
 
-  const skillId = decision.skill_id;
-  if (!skillId) {
-    console.error("Decision missing skill_id");
-    process.exit(1);
+  // Optionally append a conversation starter to encourage the user to share.
+  if (decision.conversation_starter && typeof decision.conversation_starter === "string" && decision.conversation_starter.trim()) {
+    finalReply = (finalReply + "\n\n" + decision.conversation_starter.trim()).trim();
   }
-  const skill = getSkillById(skillId);
-  if (!skill) {
-    console.error(`Unknown skill_id: ${skillId}`);
-    process.exit(1);
-  }
-
-  const input = (decision.skill_input ?? {}) as Record<string, unknown>;
-  console.error(`[bo router] next: run skill ${skill.id} (${skill.entrypoint})`);
-  if (debug) logBlock("skill input", JSON.stringify(input, null, 2));
-  const { stdout, stderr, code } = await callSkill(skill.entrypoint, input);
-  if (code !== 0) {
-    process.stdout.write(stderr || `Skill failed (exit ${code}).`);
-    return;
-  }
-  process.stdout.write(stdout || "Done.");
+  if (finalReply.length > 2000) finalReply = finalReply.slice(0, 1997) + "...";
+  process.stdout.write(finalReply);
+  appendConversation(owner, userMessage, finalReply);
 }
 
 main().catch((err) => {
-  console.error(err?.message ?? String(err));
-  process.exit(1);
+  console.error("[bo router] Error:", err?.message ?? String(err));
+  process.stdout.write(randomExcuse());
+  process.exit(0);
 });
 

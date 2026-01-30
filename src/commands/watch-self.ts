@@ -75,7 +75,12 @@ function runAgent(message: string, ctxEnv: Record<string, string>): Promise<{ st
     let stdout = "";
     let stderr = "";
     proc.stdout?.on("data", (d) => (stdout += d.toString()));
-    proc.stderr?.on("data", (d) => (stderr += d.toString()));
+    // Pipe agent stderr (router prompts/responses) to terminal so user sees them.
+    proc.stderr?.on("data", (d) => {
+      const s = d.toString();
+      stderr += s;
+      process.stderr.write(s);
+    });
     proc.on("close", (code) => resolve({ stdout: stdout.trim(), stderr: stderr.trim(), code: code ?? 0 }));
   });
 }
@@ -182,11 +187,13 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
       if (!messageToAgent) return;
 
       // Provide request context to the agent/router via env.
+      // Enable router debug so prompts/responses are printed to stderr when running the loop.
       const ctxEnv: Record<string, string> = {
         BO_REQUEST_FROM: msg.sender ?? "",
         BO_REQUEST_TO: msg.chatId ?? "",
         BO_REQUEST_IS_SELF_CHAT: isSelf ? "true" : "false",
         BO_REQUEST_IS_FROM_ME: msg.isFromMe ? "true" : "false",
+        BO_ROUTER_DEBUG: "1",
       };
 
       const { stdout, stderr, code } = await runAgent(messageToAgent, ctxEnv);

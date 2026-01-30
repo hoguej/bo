@@ -1,4 +1,4 @@
-import { deleteFact, getMemoryPath, getMemoryPathForOwner, loadMemory, normalizeOwner, upsertFact } from "../memory";
+import { deleteFact, deleteInference, getMemoryPath, getMemoryPathForOwner, loadMemory, normalizeOwner, upsertFact } from "../memory";
 
 function parseArgs(args: string[]): {
   scope: "user" | "global";
@@ -50,17 +50,27 @@ Storage: --for default = self (memory.json); --for 7404749170 = memory_740474917
 }
 
 export async function runForget(args: string[]): Promise<void> {
-  const { scope, forOwner, key } = parseArgs(args);
+  const forgetInference = args.includes("--inference");
+  const filteredArgs = forgetInference ? args.filter((a) => a !== "--inference") : args;
+  const { scope, forOwner, key } = parseArgs(filteredArgs);
   if (!key) {
     console.log(`Usage:
   bo forget [--for NUMBER] [--user|--global] <key>
+  bo forget [--for NUMBER] --inference <key>
+
+  --inference: delete an inference by key (e.g. number_of_children).
 `);
     process.exit(1);
   }
 
   const path = getMemoryPathForOwner(forOwner ?? "default");
-  const ok = deleteFact({ key, scope, path });
-  console.log(ok ? `Deleted (${scope}): ${key}` : `Not found (${scope}): ${key}`);
+  if (forgetInference) {
+    const ok = deleteInference({ key, path });
+    console.log(ok ? `Deleted inference: ${key}` : `Not found inference: ${key}`);
+  } else {
+    const ok = deleteFact({ key, scope, path });
+    console.log(ok ? `Deleted (${scope}): ${key}` : `Not found (${scope}): ${key}`);
+  }
 }
 
 export async function runFacts(args: string[]): Promise<void> {
@@ -70,16 +80,27 @@ export async function runFacts(args: string[]): Promise<void> {
   const path = getMemoryPathForOwner(owner);
   const mem = loadMemory(path);
   if (showPath) console.log(path);
-  console.log(`Facts for owner: ${owner}`);
-  if (mem.facts.length === 0) {
-    console.log("No saved facts.");
-    return;
-  }
+  console.log(`Facts and inferences for owner: ${owner}`);
 
-  const facts = [...mem.facts].sort((a, b) => a.scope.localeCompare(b.scope) || a.key.localeCompare(b.key));
-  for (const f of facts) {
-    const tags = f.tags.length ? ` [${f.tags.join(", ")}]` : "";
-    console.log(`  ${f.scope}.${f.key}=${f.value}${tags}`);
+  if (mem.facts.length > 0) {
+    console.log("Facts:");
+    const facts = [...mem.facts].sort((a, b) => a.scope.localeCompare(b.scope) || a.key.localeCompare(b.key));
+    for (const f of facts) {
+      const tags = f.tags.length ? ` [${f.tags.join(", ")}]` : "";
+      console.log(`  ${f.scope}.${f.key}=${f.value}${tags}`);
+    }
+  }
+  const inferences = mem.inferences ?? [];
+  if (inferences.length > 0) {
+    console.log("Inferences:");
+    const sorted = [...inferences].sort((a, b) => a.key.localeCompare(b.key));
+    for (const i of sorted) {
+      const based = i.basedOnKeys?.length ? ` (from: ${i.basedOnKeys.join(", ")})` : "";
+      console.log(`  ${i.key}=${i.value}${based}`);
+    }
+  }
+  if (mem.facts.length === 0 && inferences.length === 0) {
+    console.log("No saved facts or inferences.");
   }
 }
 
