@@ -7,6 +7,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { canonicalPhone } from "./phone";
 
 const DEFAULT_BO_DIR = join(homedir(), ".bo");
 const DEFAULT_DB_PATH = join(DEFAULT_BO_DIR, "bo.db");
@@ -30,12 +31,6 @@ function getDb(): import("bun:sqlite").Database {
   db = database;
   initSchema(database);
   return database;
-}
-
-function canonicalPhone(s: string): string {
-  const digits = s.replace(/\D/g, "");
-  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
-  return digits;
 }
 
 function initSchema(database: import("bun:sqlite").Database): void {
@@ -103,13 +98,36 @@ function initSchema(database: import("bun:sqlite").Database): void {
       due TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS watch_self_replied (
+      message_guid TEXT NOT NULL PRIMARY KEY,
+      created_at TEXT NOT NULL
+    );
   `);
   migrateOldTablesToUsers(database);
   migrateOwnerColumnsToUserId(database);
+  database.run("DROP TABLE IF EXISTS inferences");
   migrateFromJson(database, false);
   database.run("CREATE INDEX IF NOT EXISTS idx_facts_user_id ON facts(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_conversation_user_seq ON conversation(user_id, seq)");
   database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
+  database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
+  normalizeUserPhoneNumbers(database);
+}
+
+/** One-time: normalize existing users.phone_number to canonical form (10-digit) so lookups match. */
+function normalizeUserPhoneNumbers(database: import("bun:sqlite").Database): void {
+  const rows = database.query("SELECT id, phone_number FROM users WHERE phone_number != 'default'").all() as { id: number; phone_number: string }[];
+  for (const r of rows) {
+    const can = canonicalPhone(r.phone_number);
+    if (can !== r.phone_number && can !== "default" && can.length >= 10) {
+      try {
+        database.run("UPDATE users SET phone_number = ? WHERE id = ?", [can, r.id]);
+      } catch {
+        /* UNIQUE violation if two rows collapse to same canonical; skip */
+      }
+    }
+  }
 }
 
 /** One-time: migrate legacy contacts → users, skills_access_by_number → skills_access_by_user. */
@@ -589,7 +607,7 @@ export function dbGetContactsNameToNumber(): Map<string, string> {
   const map = new Map<string, string>();
   for (const r of rows) {
     const num = canonicalPhone(r.phone_number);
-    if (num.length >= 10) map.set(userDisplayName(r.first_name, r.last_name).toLowerCase(), num);
+    map.set(userDisplayName(r.first_name, r.last_name).toLowerCase(), num);
   }
   return map;
 }
@@ -620,6 +638,29 @@ export function dbSetContacts(entries: Array<{ name: string; number: string }>):
     const [first = "", ...rest] = e.name.trim().split(/\s+/);
     const last = rest.join(" ").trim();
     stmt.run(first, last, num);
+  }
+}
+
+// --- Watch-self: which incoming messages we've already replied to (persistent, survives restart) ---
+const WATCH_SELF_REPLIED_MAX = 2000;
+
+export function dbHasRepliedToMessage(messageGuid: string): boolean {
+  if (!messageGuid) return false;
+  const database = getDb();
+  const row = database.query("SELECT 1 FROM watch_self_replied WHERE message_guid = ?").get(messageGuid) as { "1": number } | undefined;
+  return !!row;
+}
+
+export function dbMarkMessageReplied(messageGuid: string): void {
+  if (!messageGuid) return;
+  const database = getDb();
+  database.run("INSERT OR IGNORE INTO watch_self_replied (message_guid, created_at) VALUES (?, ?)", [messageGuid, new Date().toISOString()]);
+  const count = database.query("SELECT COUNT(*) as c FROM watch_self_replied").get() as { c: number };
+  if (count.c > WATCH_SELF_REPLIED_MAX) {
+    const limit = count.c - WATCH_SELF_REPLIED_MAX;
+    database.run(
+      "DELETE FROM watch_self_replied WHERE message_guid IN (SELECT message_guid FROM watch_self_replied ORDER BY created_at ASC LIMIT " + limit + ")"
+    );
   }
 }
 

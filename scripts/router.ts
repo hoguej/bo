@@ -20,7 +20,7 @@ import {
   normalizeOwner,
   upsertFact,
 } from "../src/memory";
-import { getNameToNumber, getNumberToName } from "../src/contacts";
+import { getContactsList, getNameToNumber, getNumberToName, resolveContactToNumber } from "../src/contacts";
 import {
   getAllowedSkillIdsForOwner,
   getSkillById,
@@ -28,6 +28,7 @@ import {
   normalizeNumberForAccess,
 } from "../src/skills";
 
+/** Fact = persistent attribute about the user (stated or inferred). Inferences (e.g. Cara is female, Cara is Carrie's daughter) are stored in the same facts table. Not meeting/todo/request content. */
 type FactInput = { key: string; value: string; scope?: "user" | "global"; tags?: string[] };
 
 type RouterDecision = {
@@ -257,14 +258,16 @@ async function main() {
   const allowedSkills = registry.skills.filter((s) => allowedSkillIds.includes(s.id));
 
   const nameToNumber = getNameToNumber();
+  const numberToName = getNumberToName();
   // Short-circuit: "send Carrie the weather for tomorrow" → run weather skill, send to Carrie, reply "Okay, sent the weather to Carrie." (no LLM choice)
   const sendMatch = userMessage.trim().match(/^\s*send\s+(\w+)\s+(.+)$/is);
   if (sendMatch && nameToNumber.size > 0) {
-    const contactKey = sendMatch[1].trim().toLowerCase();
+    const contactInput = sendMatch[1].trim();
     const rest = sendMatch[2].trim().toLowerCase();
-    const sendToNumber = nameToNumber.get(contactKey);
+    const sendToNumber = resolveContactToNumber(contactInput);
     if (sendToNumber) {
-      const contactDisplay = contactKey.charAt(0).toUpperCase() + contactKey.slice(1);
+      const fullName = numberToName.get(sendToNumber);
+      const contactDisplay = fullName ? fullName.split(/\s+/)[0] : contactInput.charAt(0).toUpperCase() + contactInput.slice(1).toLowerCase();
       const isWeather = /\b(weather|forecast)\b/.test(rest);
       const days: string[] = [];
       if (/\btomorrow\b/.test(rest)) days.push("tomorrow");
@@ -310,7 +313,8 @@ async function main() {
     "",
     "You must return a SINGLE JSON object with no extra text.",
     "",
-    "Remember everything relevant about the user and their context. Save not only direct facts about the user (name, email, location) but any new information about their life: family members, ages (e.g. 'my kids are 9 and 16' → save children_ages or Cara_age, Robert_age), relationships, preferences, work, pets, where they live, etc. Use save_facts for what they stated (e.g. children_ages: '9 and 16', or Cara_age: 9, Robert_age: 16). This context is important for later replies.",
+    "Facts (save_facts) are persistent attributes about the user—both stated and inferred. Save what they state (e.g. name, family members' names, ages, location, preferences, work, pets) and reasonable inferences in the same table. Example: if Carrie says she has a kid named Cara, save the stated fact (e.g. Carrie_child: Cara) and inferred facts (e.g. Cara_gender: female, Cara_relation_to_Carrie: daughter). Use short keys (e.g. name, Cara_age, home_zip, Cara_relation_to_Carrie).",
+    "Do NOT use save_facts for: meeting titles, meeting subjects, todo text, one-off requests, or requested actions. Only store attributes about the user (and their family/context); not transient requests or events.",
     "",
     "Decide whether to use a local skill (script) or respond normally.",
     "Prefer using a local skill when it can answer the user request more reliably than a general response (e.g. weather).",
@@ -325,7 +329,7 @@ async function main() {
     "",
     "Todo list: Use skill_id todo for any todo request. Each person has their own list (sender's list by default). You can also act on a contact's list with for_contact (e.g. for_contact: 'Carrie'). Actions: add (text required; optional due); list (shows #1, #2, #3); mark_done (number required, e.g. 2 for #2); remove (number); edit (number and text); set_due (number and due). Examples: 'add a todo to Carrie's list to make me coffee' → action add, text 'make me coffee', for_contact 'Carrie'; 'what are Carrie's todos' or 'list Carrie's todos' → action list, for_contact 'Carrie'; 'mark #2 done' → action mark_done, number 2. When listing someone else's todos, reply in a friendly way (e.g. 'Carrie has a todo to make you coffee' when there's one).",
     "",
-    "Send to a contact: When the user asks to send something to a specific person, use action=send_to_contact. Set contact_name to the person's first name (exactly as in the contacts list) and reply_to_sender to a short confirmation (e.g. 'Sent that poem to Carrie.'). Two cases: (1) Skill-based content (e.g. weather): set skill_id and skill_input; we run the skill and send its output to the contact. (2) Content you compose (poem, joke, custom message): set send_body to the exact text to send to the contact—we send it as-is. Do NOT use action=respond with the poem/message in response_text; use send_to_contact with send_body so we actually send it to the contact. Only use send_to_contact for contacts in the contacts list.",
+    "Send to a contact: When the user asks to send something to a specific person, use action=send_to_contact. Set contact_name to the person's first name (so we can resolve them). In reply_to_sender use only the person's first name (e.g. 'Sent that poem to Cara.' not 'Sent to Cara Hogue.'). Two cases: (1) Skill-based content (e.g. weather): set skill_id and skill_input; we run the skill and send its output to the contact. (2) Content you compose (poem, joke, custom message): set send_body to the exact text to send to the contact—we send it as-is. Do NOT use action=respond with the poem/message in response_text; use send_to_contact with send_body so we actually send it to the contact. Only use send_to_contact for contacts in the contacts list.",
     "",
     "If the user asks what you know about them: use action=respond and list Facts from the payload. If there are none, say you don't have any stored yet.",
     "",
@@ -336,7 +340,7 @@ async function main() {
     "If using a local skill: action=use_skill, skill_id from registry, skill_input with only needed parameters.",
     "If responding normally: action=respond, response_text (what to send back).",
     "",
-    "When the user states any personal or contextual info (about themselves, family, ages, relationships, preferences, life details): add to save_facts as {key, value, scope?, tags?}. Never invent facts.",
+    "When the user states a fact about themselves (name, family, ages, preferences, location, work, pets, etc.): add to save_facts as {key, value, scope?, tags?}. You may also add reasonable inferences (e.g. relationship, gender) as separate save_facts entries. Do not add meeting/todo/request content. Never invent facts.",
     "",
     "CRITICAL: Your response must be a single JSON object. It MUST always include 'action' (either 'use_skill', 'respond', or 'send_to_contact'). If you are only saving facts with no other reply, use action='respond' and set response_text to a short acknowledgment (e.g. 'Got it, I've noted that.'). Never omit action.",
     "",
@@ -356,13 +360,14 @@ async function main() {
     inputSchema: s.inputSchema,
   }));
 
-  const contactNames = nameToNumber.size > 0 ? [...nameToNumber.keys()].join(", ") : "(none)";
+  const contactsList = getContactsList();
+  const contactNames = contactsList.length > 0 ? contactsList.map((c) => c.name).join(", ") : "(none)";
 
   const userPayload = [
     "Context:",
     JSON.stringify(context),
     "",
-    nameToNumber.size > 0 ? `Contacts (for send_to_contact; use these exact names): ${contactNames}\n` : "",
+    contactsList.length > 0 ? `Contacts (for send_to_contact; identify by first name; in reply_to_sender use first name only): ${contactNames}\n` : "",
     factsBlock || "Facts: (none)",
     "",
     personalityBlock ? `Personality directions for this user (follow these): ${personalityBlock}\n` : "",
@@ -475,12 +480,25 @@ async function main() {
     const contactName = (decision.contact_name ?? "").trim();
     const replyToSenderText = (decision.reply_to_sender ?? "").trim();
     const llmSendBody = (decision.send_body ?? "").trim();
-    const nameToNumber = getNameToNumber();
-    const sendToNumber = contactName ? nameToNumber.get(contactName.toLowerCase()) : undefined;
-    if (!contactName || !replyToSenderText || !sendToNumber) {
-      logErr(`send_to_contact missing or unknown contact: contact_name=${contactName} reply_to_sender=${replyToSenderText ? "set" : "missing"} resolved=${sendToNumber ?? "none"}`);
-      const displayName = contactName ? contactName.charAt(0).toUpperCase() + contactName.slice(1).toLowerCase() : "that person";
+    const sendToNumber = contactName ? resolveContactToNumber(contactName) : undefined;
+    const first = contactName.split(/\s+/)[0];
+    const displayName = first ? first.charAt(0).toUpperCase() + first.slice(1).toLowerCase() : "that person";
+    if (!contactName || !replyToSenderText) {
+      logErr(`send_to_contact missing contact_name or reply_to_sender`);
+      process.stdout.write("I need a contact and a reply to send.");
+      appendConversation(owner, userMessage, "I need a contact and a reply to send.");
+      return;
+    }
+    if (sendToNumber === undefined) {
+      logErr(`send_to_contact unknown contact: contact_name=${contactName} resolved=none`);
       const friendlyMsg = `I don't know who ${displayName} is.`;
+      process.stdout.write(friendlyMsg);
+      appendConversation(owner, userMessage, friendlyMsg);
+      return;
+    }
+    if (sendToNumber.length < 10) {
+      logErr(`send_to_contact no valid number for contact: contact_name=${contactName}`);
+      const friendlyMsg = `I have ${displayName} in contacts but I don't have a valid phone number to send to.`;
       process.stdout.write(friendlyMsg);
       appendConversation(owner, userMessage, friendlyMsg);
       return;
@@ -575,9 +593,8 @@ async function main() {
     if (skillId === "todo" && code === 0) {
       const forContact = (input.for_contact as string)?.trim();
       if (forContact) {
-        const nameToNumber = getNameToNumber();
         const numberToName = getNumberToName();
-        const sendToNumber = nameToNumber.get(forContact.toLowerCase());
+        const sendToNumber = resolveContactToNumber(forContact);
         const senderName = numberToName.get(owner) ?? (owner === "default" ? "Someone" : owner);
         const action = String((input.action as string) ?? "add").toLowerCase();
         const text = (input.text as string)?.trim();

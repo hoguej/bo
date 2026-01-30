@@ -11,6 +11,7 @@ import {
   dbGetSummary,
   dbUpsertFact,
 } from "./db";
+import { canonicalPhone } from "./phone";
 
 export type FactScope = "global" | "user";
 
@@ -31,14 +32,10 @@ type MemoryFile = {
 const DEFAULT_MEMORY_DIR = join(homedir(), ".bo");
 const DEFAULT_MEMORY_PATH = join(DEFAULT_MEMORY_DIR, "memory.json");
 
-/** Owner "default" = self / primary user. Other owners = sender id (e.g. 7404749170, 6143480678). US 11-digit → 10-digit so +16143480678 matches 6143480678. */
+/** Owner "default" = self / primary user. Other owners = canonical 10-digit (e.g. 7404749170). Uses central phone normalization. */
 export function normalizeOwner(sender: string | undefined): string {
-  if (!sender || !sender.trim()) return "default";
-  const s = sender.trim();
-  const digits = s.replace(/\D/g, "");
-  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
-  if (digits.length >= 10) return digits;
-  return "default";
+  const c = canonicalPhone((sender ?? "").trim() || "default");
+  return c === "default" || c.length < 10 ? "default" : c;
 }
 
 /** Path for a given owner. default = primary (memory.json). Others = memory_<owner>.json. */

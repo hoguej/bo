@@ -2,6 +2,8 @@ import type { IMessageSDK } from "@photon-ai/imessage-kit";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { getNumberToName } from "../contacts";
+import { dbHasRepliedToMessage, dbMarkMessageReplied } from "../db";
+import { canonicalPhone, toE164 } from "../phone";
 
 /** Message-like object from watcher or getMessages (minimal shape we use). */
 type MessageLike = {
@@ -47,29 +49,9 @@ const recentSentReplyTexts = new Set<string>();
 const recentSentReplyOrder: string[] = [];
 const MAX_RECENT_SENT = 50;
 
-/** Catch-up: poll for missed messages (e.g. after wake from sleep). Interval ms; delay before first run. */
-const CATCH_UP_INTERVAL_MS = 90_000; // 90 seconds
-const CATCH_UP_DELAY_MS = 120_000; // 2 minutes before first catch-up (let watcher deliver recent ones first)
-const CATCH_UP_MESSAGE_LIMIT = 60;
-
-function normalizePhone(s: string): string {
-  return s.replace(/\D/g, "");
-}
-
-/** US numbers: 11 digits starting with 1 → use last 10 so +16143480678 matches 6143480678. */
-function canonicalPhone(s: string): string {
-  const digits = normalizePhone(s);
-  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
-  return digits;
-}
-
-/** Format for iMessage delivery: 10-digit US number → +1XXXXXXXXXX (E.164). */
-function toE164(recipient: string): string {
-  const digits = normalizePhone(recipient);
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
-  return recipient.startsWith("+") ? recipient : `+${recipient}`;
-}
+/** Only send one reply every REPLY_RATE_LIMIT_MS; ignore messages that come in faster. */
+const REPLY_RATE_LIMIT_MS = 3000;
+let lastReplyAt = 0;
 
 const NUMBER_TO_NAME = getNumberToName();
 
@@ -202,6 +184,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
   const guid = msg.guid ?? msg.id;
   if (!guid) return;
 
+  if (dbHasRepliedToMessage(guid)) return;
   if (sentMessageGuids.has(guid)) return;
   if (text && recentSentReplyTexts.has(text)) return;
   if (processedMessageGuids.has(guid)) return;
@@ -247,6 +230,11 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
   if (processedMessageKeyOrder.length > MAX_PROCESSED_KEYS) {
     const old = processedMessageKeyOrder.shift()!;
     processedMessageKeys.delete(old);
+  }
+
+  if (Date.now() - lastReplyAt < REPLY_RATE_LIMIT_MS) {
+    console.error(`[bo watch-self] rate limit: ignoring message (replies limited to once per ${REPLY_RATE_LIMIT_MS / 1000}s)`);
+    return;
   }
 
   const requestId = newRequestId();
@@ -316,6 +304,8 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         const latest = recent.messages[0];
         if (latest?.isFromMe && latest.guid) sentMessageGuids.add(latest.guid);
       }
+      dbMarkMessageReplied(guid);
+      lastReplyAt = Date.now();
     } else {
       recentSentReplyTexts.add(bodyToSend);
       recentSentReplyOrder.push(bodyToSend);
@@ -332,6 +322,8 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         const latest = recent.messages[0];
         if (latest?.isFromMe && latest.guid) sentMessageGuids.add(latest.guid);
       }
+      dbMarkMessageReplied(guid);
+      lastReplyAt = Date.now();
     }
   } else {
     let reply = code === 0 ? (stdoutStr || "Done.") : (stderr || `Exit ${code}`);
@@ -353,6 +345,8 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         sentMessageGuids.add(latest.guid);
       }
     }
+    dbMarkMessageReplied(guid);
+    lastReplyAt = Date.now();
   }
 }
 
@@ -382,35 +376,6 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
       console.error("[bo watch-self] error:", err);
     },
   });
-
-  // Catch-up: poll for messages that arrived while asleep (or watcher missed). Process any unprocessed "Bo" messages.
-  async function catchUp() {
-    try {
-      const result = await sdk.getMessages({ limit: CATCH_UP_MESSAGE_LIMIT });
-      const messages = result.messages ?? [];
-      const sorted = [...messages].sort((a, b) => {
-        const da = a.date instanceof Date ? a.date.getTime() : (a as { date?: string }).date ? new Date((a as { date: string }).date).getTime() : 0;
-        const db = b.date instanceof Date ? b.date.getTime() : (b as { date?: string }).date ? new Date((b as { date: string }).date).getTime() : 0;
-        return da - db;
-      });
-      for (const msg of sorted) {
-        const text = (msg.text ?? "").trim();
-        if (!text.toLowerCase().startsWith("bo") || !text.slice(2).trim()) continue;
-        if (msg.isFromMe) continue; // never process our own messages
-        const inSelfChat = isSelfChat(msg.chatId ?? "");
-        const isFromAllowed = AGENT_NUMBERS.size > 0 ? isFromAgentNumber(msg.sender ?? "") : false;
-        if (!inSelfChat && !isFromAllowed) continue;
-        await handleIncomingMessage(msg as MessageLike, sdk);
-      }
-    } catch (err) {
-      console.error("[bo watch-self] catch-up error:", err instanceof Error ? err.message : String(err));
-    }
-  }
-
-  setTimeout(() => {
-    catchUp();
-    setInterval(catchUp, CATCH_UP_INTERVAL_MS);
-  }, CATCH_UP_DELAY_MS);
 
   // Keep process alive; startWatching() returns after registering the watcher
   await new Promise<never>(() => {});

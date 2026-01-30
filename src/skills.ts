@@ -4,6 +4,7 @@ import {
   dbGetSkillsRegistry,
   type SkillRow,
 } from "./db";
+import { canonicalPhone } from "./phone";
 
 export type SkillDef = {
   id: string;
@@ -62,14 +63,10 @@ export function loadSkillAccessConfig(): SkillAccessConfig | null {
   };
 }
 
-/** Normalize sender to 10-digit for access lookup (matches memory normalizeOwner). */
+/** Normalize sender to 10-digit for access lookup (matches memory normalizeOwner). Uses central phone normalization. */
 export function normalizeNumberForAccess(sender: string | undefined): string {
-  if (!sender || !sender.trim()) return "default";
-  const s = sender.trim();
-  const digits = s.replace(/\D/g, "");
-  if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
-  if (digits.length >= 10) return digits;
-  return "default";
+  const c = canonicalPhone((sender ?? "").trim() || "default");
+  return c === "default" || c.length < 10 ? "default" : c;
 }
 
 /**
