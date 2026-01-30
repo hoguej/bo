@@ -20,6 +20,7 @@ bun install
 - `BO_MY_PHONE` or `BO_MY_EMAIL` — for send-self and watch-self self-chat
 - `BO_AGENT_SCRIPT` — for watch-self (script that takes message as first arg, prints response)
 - `BO_AGENT_NUMBERS` — comma-separated numbers (e.g. `7404749170,6143480678`); when any of these send a message, the agent replies in that chat
+- `BO_TELEGRAM_BOT_TOKEN` — optional; if set, watch-self also runs a Telegram bot in the same process. See [docs/telegram-setup.md](docs/telegram-setup.md) (send `/myid` to your bot to get your Telegram ID, then set `users.telegram_id` in admin).
 - `AI_GATEWAY_API_KEY` — Vercel AI Gateway API key (used by `scripts/agent.sh` to answer via `openai/gpt-4.1` by default)
 - `BO_LLM_MODEL` — override the model (default: `openai/gpt-4.1`)
 

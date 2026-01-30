@@ -112,6 +112,7 @@ function initSchema(database: import("bun:sqlite").Database): void {
   migrateOldTablesToUsers(database);
   migrateOwnerColumnsToUserId(database);
   migrateUsersAddCanTriggerAgent(database);
+  migrateUsersAddTelegramId(database);
   database.run("DROP TABLE IF EXISTS inferences");
   migrateFromJson(database, false);
   database.run("CREATE INDEX IF NOT EXISTS idx_facts_user_id ON facts(user_id)");
@@ -177,6 +178,14 @@ function migrateUsersAddCanTriggerAgent(database: import("bun:sqlite").Database)
   database.run("UPDATE users SET can_trigger_agent = 0 WHERE phone_number = 'default'");
 }
 
+/** One-time: add telegram_id to users (allowlist for Telegram; link to existing user). */
+function migrateUsersAddTelegramId(database: import("bun:sqlite").Database): void {
+  const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
+  if (cols.some((c) => c.name === "telegram_id")) return;
+  database.run("ALTER TABLE users ADD COLUMN telegram_id TEXT");
+  database.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL");
+}
+
 /** One-time: normalize existing users.phone_number to canonical form (10-digit) so lookups match. */
 function normalizeUserPhoneNumbers(database: import("bun:sqlite").Database): void {
   const rows = database.query("SELECT id, phone_number FROM users WHERE phone_number != 'default'").all() as { id: number; phone_number: string }[];
@@ -229,9 +238,16 @@ function migrateOldTablesToUsers(database: import("bun:sqlite").Database): void 
   }
 }
 
-/** Resolve owner string ("default" or canonical phone) to user_id. Creates user if missing (for phone numbers). */
-function resolveOwnerToUserId(database: import("bun:sqlite").Database, owner: string): number {
-  const key = !owner || owner === "default" ? "default" : canonicalPhone(owner);
+/** Resolve owner string ("default", canonical phone, or "telegram:<id>") to user_id. For telegram:<id> only looks up (never creates). Returns undefined when Telegram ID has no user. */
+function resolveOwnerToUserId(database: import("bun:sqlite").Database, owner: string): number | undefined {
+  const trimmed = (owner ?? "").trim();
+  if (trimmed.startsWith("telegram:")) {
+    const id = trimmed.slice(9).trim();
+    if (!id) return undefined;
+    const row = database.query("SELECT id FROM users WHERE telegram_id = ?").get(id) as { id: number } | undefined;
+    return row?.id;
+  }
+  const key = !trimmed || trimmed === "default" ? "default" : canonicalPhone(trimmed);
   const row = database.query("SELECT id FROM users WHERE phone_number = ?").get(key) as { id: number } | undefined;
   if (row) return row.id;
   if (key === "default") {
@@ -726,6 +742,25 @@ export function dbGetPrimaryUserPhone(): string | undefined {
   return row?.phone_number;
 }
 
+/** Resolve Telegram user id to user_id (for allowlist). Returns undefined if no user has that telegram_id. */
+export function dbGetUserIdByTelegramId(telegramId: string): number | undefined {
+  const id = (telegramId ?? "").toString().trim();
+  if (!id) return undefined;
+  const database = getDb();
+  const row = database.query("SELECT id FROM users WHERE telegram_id = ?").get(id) as { id: number } | undefined;
+  return row?.id;
+}
+
+/** Get telegram_id for a user identified by canonical phone. Used to prefer Telegram when sending to a contact. */
+export function dbGetTelegramIdByPhone(phone: string): string | undefined {
+  const can = canonicalPhone((phone ?? "").trim());
+  if (!can || can === "default" || can.length < 10) return undefined;
+  const database = getDb();
+  const row = database.query("SELECT telegram_id FROM users WHERE phone_number = ?").get(can) as { telegram_id: string | null } | undefined;
+  const tid = row?.telegram_id?.trim();
+  return tid || undefined;
+}
+
 /** Phone numbers that can trigger the agent (watch-self). From users where can_trigger_agent = 1. */
 export function dbGetPhoneNumbersThatCanTriggerAgent(): string[] {
   const database = getDb();
@@ -808,17 +843,21 @@ export function dbGetSkillsAccessDefault(): string[] {
 export function dbGetSkillsAccessByNumber(): Record<string, string[]> {
   const database = getDb();
   const rows = database.query(`
-    SELECT u.phone_number, s.allowed FROM skills_access_by_user s
+    SELECT u.phone_number, u.telegram_id, s.allowed FROM skills_access_by_user s
     JOIN users u ON s.user_id = u.id
-  `).all() as { phone_number: string; allowed: string }[];
+  `).all() as { phone_number: string; telegram_id: string | null; allowed: string }[];
   const out: Record<string, string[]> = {};
   for (const r of rows) {
-    const num = canonicalPhone(r.phone_number);
     try {
       const arr = JSON.parse(r.allowed) as unknown;
-      out[num] = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+      const allowed = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
+      const num = canonicalPhone(r.phone_number);
+      if (num) out[num] = allowed;
+      const tid = r.telegram_id?.trim();
+      if (tid) out["telegram:" + tid] = allowed;
     } catch {
-      out[num] = [];
+      const num = canonicalPhone(r.phone_number);
+      if (num) out[num] = [];
     }
   }
   return out;
@@ -846,12 +885,14 @@ export function dbSetSkillsAccess(defaultAllowed: string[], byNumber: Record<str
 export function dbGetFacts(owner: string): Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }> {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return [];
   return database.query("SELECT key, value, scope, tags, created_at AS createdAt, updated_at AS updatedAt FROM facts WHERE user_id = ?").all(userId) as Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }>;
 }
 
 export function dbUpsertFact(owner: string, key: string, value: string, scope: string, tags: string[]): void {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return;
   const now = new Date().toISOString();
   const tagsJson = JSON.stringify(tags);
   database.run(
@@ -864,6 +905,7 @@ export function dbUpsertFact(owner: string, key: string, value: string, scope: s
 export function dbDeleteFact(owner: string, key: string, scope: string): boolean {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return false;
   const result = database.run("DELETE FROM facts WHERE user_id = ? AND key = ? AND scope = ?", [userId, key, scope]);
   return (result as { changes: number }).changes > 0;
 }
@@ -872,6 +914,7 @@ export function dbDeleteFact(owner: string, key: string, scope: string): boolean
 export function dbGetConversation(owner: string, max: number): Array<{ role: string; content: string }> {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return [];
   const rows = database.query("SELECT role, content FROM conversation WHERE user_id = ? ORDER BY seq DESC LIMIT ?").all(userId, max) as Array<{ role: string; content: string }>;
   return rows.reverse();
 }
@@ -879,6 +922,7 @@ export function dbGetConversation(owner: string, max: number): Array<{ role: str
 export function dbAppendConversation(owner: string, userContent: string, assistantContent: string, maxMessages: number): void {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return;
   const next = database.query("SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM conversation WHERE user_id = ?").get(userId) as { n: number };
   const seq = next?.n ?? 1;
   database.run("INSERT INTO conversation (user_id, seq, role, content) VALUES (?, ?, 'user', ?)", [userId, seq, userContent.trim()]);
@@ -896,6 +940,7 @@ const MAX_SUMMARY_SENTENCES = 50;
 export function dbAppendSummarySentence(owner: string, sentence: string): void {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return;
   const s = sentence.trim();
   if (!s) return;
   const row = database.query("SELECT sentences FROM summary WHERE user_id = ?").get(userId) as { sentences: string } | undefined;
@@ -908,6 +953,7 @@ export function dbAppendSummarySentence(owner: string, sentence: string): void {
 export function dbGetSummary(owner: string): string {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return "";
   const row = database.query("SELECT sentences FROM summary WHERE user_id = ?").get(userId) as { sentences: string } | undefined;
   if (!row) return "";
   try {
@@ -924,6 +970,7 @@ const MAX_PERSONALITY_INSTRUCTIONS = 20;
 export function dbAppendPersonalityInstruction(owner: string, instruction: string): void {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return;
   const raw = instruction.trim();
   if (!raw) return;
   const toAdd = raw.includes(". ") ? raw.split(/.\.\s+/).map((s) => s.trim()).filter(Boolean) : [raw];
@@ -944,6 +991,7 @@ export function dbAppendPersonalityInstruction(owner: string, instruction: strin
 export function dbGetPersonality(owner: string): string {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return "";
   const row = database.query("SELECT instructions FROM personality WHERE user_id = ?").get(userId) as { instructions: string } | undefined;
   if (!row) return "";
   try {
@@ -958,12 +1006,14 @@ export function dbGetPersonality(owner: string): string {
 export function dbGetTodos(owner: string): Array<{ id: number; text: string; done: number; due: string | null; createdAt: string }> {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return [];
   return database.query("SELECT id, text, done, due, created_at AS createdAt FROM todos WHERE user_id = ? ORDER BY id").all(userId) as Array<{ id: number; text: string; done: number; due: string | null; createdAt: string }>;
 }
 
 export function dbAddTodo(owner: string, text: string, due: string | null): void {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return;
   const now = new Date().toISOString();
   database.run("INSERT INTO todos (user_id, text, done, due, created_at) VALUES (?, ?, 0, ?, ?)", [userId, text, due, now]);
 }
@@ -971,6 +1021,7 @@ export function dbAddTodo(owner: string, text: string, due: string | null): void
 export function dbUpdateTodoDone(owner: string, id: number): boolean {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return false;
   const result = database.run("UPDATE todos SET done = 1 WHERE user_id = ? AND id = ?", [userId, id]);
   return (result as { changes: number }).changes > 0;
 }
@@ -978,6 +1029,7 @@ export function dbUpdateTodoDone(owner: string, id: number): boolean {
 export function dbDeleteTodo(owner: string, id: number): boolean {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return false;
   const result = database.run("DELETE FROM todos WHERE user_id = ? AND id = ?", [userId, id]);
   return (result as { changes: number }).changes > 0;
 }
@@ -985,6 +1037,7 @@ export function dbDeleteTodo(owner: string, id: number): boolean {
 export function dbUpdateTodoText(owner: string, id: number, text: string): boolean {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return false;
   const result = database.run("UPDATE todos SET text = ? WHERE user_id = ? AND id = ?", [text, userId, id]);
   return (result as { changes: number }).changes > 0;
 }
@@ -992,6 +1045,7 @@ export function dbUpdateTodoText(owner: string, id: number, text: string): boole
 export function dbUpdateTodoDue(owner: string, id: number, due: string): boolean {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return false;
   const result = database.run("UPDATE todos SET due = ? WHERE user_id = ? AND id = ?", [due, userId, id]);
   return (result as { changes: number }).changes > 0;
 }

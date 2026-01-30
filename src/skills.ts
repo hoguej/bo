@@ -63,9 +63,11 @@ export function loadSkillAccessConfig(): SkillAccessConfig | null {
   };
 }
 
-/** Normalize sender to 10-digit for access lookup (matches memory normalizeOwner). Uses central phone normalization. */
+/** Normalize sender to 10-digit or "telegram:<id>" for access lookup (matches memory normalizeOwner). Pass through telegram:<id>. */
 export function normalizeNumberForAccess(sender: string | undefined): string {
-  const c = canonicalPhone((sender ?? "").trim() || "default");
+  const trimmed = (sender ?? "").trim();
+  if (trimmed.startsWith("telegram:")) return trimmed;
+  const c = canonicalPhone(trimmed || "default");
   return c === "default" || c.length < 10 ? "default" : c;
 }
 

@@ -1,9 +1,11 @@
 import type { IMessageSDK } from "@photon-ai/imessage-kit";
+import { Bot } from "grammy";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { getNumberToName } from "../contacts";
 import {
   dbGetConfig,
+  dbGetUserIdByTelegramId,
   dbGetPhoneNumbersThatCanTriggerAgent,
   dbGetPrimaryUserPhone,
   dbHasRepliedToMessage,
@@ -65,6 +67,22 @@ const MAX_RECENT_SENT = 50;
 const REPLY_RATE_LIMIT_MS = 3000;
 let lastReplyAt = 0;
 
+/** DOS: unknown Telegram senders — max requests per minute per sender; above threshold drop silently (no log). */
+const TELEGRAM_UNKNOWN_RATE_MAX = 20;
+const TELEGRAM_UNKNOWN_RATE_WINDOW_MS = 60_000;
+const telegramUnknownBySender = new Map<string, number[]>();
+
+function telegramUnknownRateLimit(telegramId: string): boolean {
+  const now = Date.now();
+  const cutoff = now - TELEGRAM_UNKNOWN_RATE_WINDOW_MS;
+  let list = telegramUnknownBySender.get(telegramId) ?? [];
+  list = list.filter((t) => t >= cutoff);
+  if (list.length >= TELEGRAM_UNKNOWN_RATE_MAX) return true;
+  list.push(now);
+  telegramUnknownBySender.set(telegramId, list);
+  return false;
+}
+
 const NUMBER_TO_NAME = getNumberToName();
 
 function senderDisplay(sender: string): string {
@@ -105,6 +123,99 @@ function sanitizeReply(reply: string): string {
     return "→ " + r;
   }
   return r;
+}
+
+/** Stored so handleIncomingMessage can send to contacts via Telegram when sendToTelegramId is set. */
+let telegramBotInstance: Bot | null = null;
+
+/** Create and configure Telegram bot; call bot.start() to run long polling (same process as iMessage watcher). Pass sdk so Telegram handler can send to contacts via iMessage when they have no telegram_id. */
+function createTelegramBot(sdk: IMessageSDK): Bot | null {
+  const token = process.env.BO_TELEGRAM_BOT_TOKEN?.trim();
+  if (!token) return null;
+  const bot = new Bot(token);
+
+  const replyWithTelegramId = (ctx: { from?: { id?: number }; reply: (text: string) => Promise<unknown> }) => {
+    const id = ctx.from?.id;
+    if (id != null) {
+      ctx.reply(`Your Telegram ID is ${id}. Add this to your user in the admin (users.telegram_id) to use the agent.`);
+    }
+  };
+  bot.command("start", replyWithTelegramId);
+  bot.command("myid", replyWithTelegramId);
+  bot.command("id", replyWithTelegramId);
+
+  bot.on("message:text", async (ctx) => {
+    const text = (ctx.message?.text ?? "").trim();
+    const from = ctx.from;
+    if (!from?.id) return;
+    const telegramId = String(from.id);
+    const owner = "telegram:" + telegramId;
+
+    if (/^\/(start|myid|id)(\s|$)/i.test(text)) return; // Handled by command handlers; skip agent
+
+    const userId = dbGetUserIdByTelegramId(telegramId);
+    if (userId == null) {
+      if (telegramUnknownRateLimit(telegramId)) return; // DOS: drop silently
+      console.error(`[bo telegram] unknown telegram_id=${telegramId} text="${text.slice(0, 200)}${text.length > 200 ? "…" : ""}"`);
+      return;
+    }
+
+    if (Date.now() - lastReplyAt < REPLY_RATE_LIMIT_MS) return;
+
+    const script = getAgentScript();
+    if (!script) {
+      await ctx.reply("Agent script not configured.");
+      return;
+    }
+
+    const requestId = newRequestId();
+    const ctxEnv: Record<string, string> = {
+      BO_REQUEST_ID: requestId,
+      BO_REQUEST_FROM: owner,
+      BO_REQUEST_TO: "telegram",
+      BO_REQUEST_IS_SELF_CHAT: "false",
+      BO_REQUEST_IS_FROM_ME: "false",
+      BO_ROUTER_DEBUG: "1",
+    };
+    console.error(`[bo telegram] [req:${requestId}] invoking agent (${text.length} chars) from telegram_id=${telegramId}`);
+    const { stdout, stderr, code } = await runAgent(text, ctxEnv);
+    if (code !== 0 && stderr?.trim()) {
+      console.error(`[bo telegram] [req:${requestId}] agent stderr: ${stderr.trim().slice(0, 300)}`);
+    }
+    const stdoutStr = (stdout ?? "").trim();
+    let reply = code !== 0 ? (stderr || `Exit ${code}`) : stdoutStr;
+    if (stdoutStr && code === 0) {
+      const firstLine = stdoutStr.split("\n")[0] ?? "";
+      try {
+        const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+        const sendTo = typeof parsed.sendTo === "string" ? parsed.sendTo.trim() : "";
+        const sendBody = typeof parsed.sendBody === "string" ? parsed.sendBody.trim() : "";
+        const replyToSender = typeof parsed.replyToSender === "string" ? parsed.replyToSender.trim() : "";
+        const sendToTelegramId = typeof parsed.sendToTelegramId === "string" ? parsed.sendToTelegramId.trim() : "";
+        if (sendTo && sendBody && replyToSender) {
+          const bodyToSend = sanitizeReply(sendBody.length > 4000 ? sendBody.slice(0, 3997) + "..." : sendBody);
+          const replyText = sanitizeReply(replyToSender.length > 4000 ? replyToSender.slice(0, 3997) + "..." : replyToSender);
+          if (sendToTelegramId) {
+            await bot.api.sendMessage(sendToTelegramId, bodyToSend);
+          } else {
+            await sdk.send(toE164(sendTo), bodyToSend);
+          }
+          await ctx.reply(replyText);
+          lastReplyAt = Date.now();
+          return;
+        }
+        if (typeof parsed.response_text === "string") reply = parsed.response_text.trim();
+        else if (typeof parsed.replyToSender === "string") reply = parsed.replyToSender.trim();
+      } catch {
+        /* use full stdout */
+      }
+    }
+    if (reply.length > 4000) reply = reply.slice(0, 3997) + "...";
+    await ctx.reply(reply);
+    lastReplyAt = Date.now();
+  });
+
+  return bot;
 }
 
 function runAgent(message: string, ctxEnv: Record<string, string>): Promise<{ stdout: string; stderr: string; code: number }> {
@@ -277,6 +388,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
   let sendToContact: string | null = null;
   let sendBody: string | null = null;
   let replyToSender: string | null = null;
+  let sendToTelegramId: string | null = null;
   if (code === 0 && firstLine) {
     try {
       const parsed = JSON.parse(firstLine) as Record<string, unknown>;
@@ -288,6 +400,8 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         sendToContact = parsed.sendTo.trim();
         sendBody = parsed.sendBody.trim();
         replyToSender = parsed.replyToSender.trim();
+        if (typeof parsed.sendToTelegramId === "string" && parsed.sendToTelegramId.trim())
+          sendToTelegramId = parsed.sendToTelegramId.trim();
       }
     } catch {
       /* not JSON */
@@ -305,7 +419,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
     }
     const sendToNorm = canonicalPhone(sendToContact);
     const replyToNorm = canonicalPhone(replyTo);
-    const sameRecipient = sendToNorm && replyToNorm && sendToNorm === replyToNorm;
+    const sameRecipient = !sendToTelegramId && sendToNorm && replyToNorm && sendToNorm === replyToNorm;
     if (sameRecipient) {
       recentSentReplyTexts.add(bodyToSend);
       recentSentReplyOrder.push(bodyToSend);
@@ -329,8 +443,12 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         const old = recentSentReplyOrder.shift()!;
         recentSentReplyTexts.delete(old);
       }
-      const resultToContact = await sdk.send(toE164(sendToContact), bodyToSend);
-      if (resultToContact.message?.guid) sentMessageGuids.add(resultToContact.message.guid);
+      if (sendToTelegramId && telegramBotInstance) {
+        await telegramBotInstance.api.sendMessage(sendToTelegramId, bodyToSend);
+      } else {
+        const resultToContact = await sdk.send(toE164(sendToContact), bodyToSend);
+        if (resultToContact.message?.guid) sentMessageGuids.add(resultToContact.message.guid);
+      }
       const resultToSender = await sdk.send(replyTo, reply);
       if (resultToSender.message?.guid) sentMessageGuids.add(resultToSender.message.guid);
       if (!resultToSender.message?.guid) {
@@ -382,6 +500,12 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
     console.error(`[bo watch-self] Self-chat or from ${[...AGENT_NUMBERS].join(", ")}: same rule — must start with 'Bo'.\n`);
   } else {
     console.error("");
+  }
+
+  telegramBotInstance = createTelegramBot(sdk);
+  if (telegramBotInstance) {
+    console.error("[bo watch-self] Telegram bot enabled (BO_TELEGRAM_BOT_TOKEN set). Send /myid to your bot to get your Telegram ID, then set users.telegram_id in admin.");
+    void telegramBotInstance.start();
   }
 
   await sdk.startWatching({

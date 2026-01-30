@@ -21,7 +21,7 @@ import {
   upsertFact,
 } from "../src/memory";
 import { getContactsList, getNameToNumber, getNumberToName, resolveContactToNumber } from "../src/contacts";
-import { dbGetConfig } from "../src/db";
+import { dbGetConfig, dbGetTelegramIdByPhone } from "../src/db";
 import {
   getAllowedSkillIdsForOwner,
   getSkillById,
@@ -288,7 +288,9 @@ async function main() {
           if (code === 0 && stdout?.trim()) {
             const sendBody = stdout.trim().length > 2000 ? stdout.trim().slice(0, 1997) + "..." : stdout.trim();
             const replyToSender = `Okay, sent the weather to ${contactDisplay}.`;
-            const payload = { sendTo: sendToNumber, sendBody, replyToSender };
+            const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+            const payload: Record<string, string> = { sendTo: sendToNumber, sendBody, replyToSender };
+            if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
             process.stdout.write(JSON.stringify(payload) + "\n");
             appendConversation(owner, userMessage, replyToSender);
             return;
@@ -544,11 +546,13 @@ async function main() {
       sendBody = await rephraseSkillOutputForUser(openai, model, (stdout || "Done.").trim(), userMessage, requestId);
       sendBody = sendBody.length > 2000 ? sendBody.slice(0, 1997) + "..." : sendBody;
     }
-    const payload: { sendTo: string; sendBody: string; replyToSender: string } = {
+    const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+    const payload: Record<string, string> = {
       sendTo: sendToNumber,
       sendBody,
       replyToSender: replyToSenderText.length > 2000 ? replyToSenderText.slice(0, 1997) + "..." : replyToSenderText,
     };
+    if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
     process.stdout.write(JSON.stringify(payload) + "\n");
     appendConversation(owner, userMessage, replyToSenderText);
     return;
@@ -616,11 +620,13 @@ async function main() {
           notification = `${senderName} made a change to your todo list.`;
         }
         if (sendToNumber) {
-          const payload: { sendTo: string; sendBody: string; replyToSender: string } = {
+          const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+          const payload: Record<string, string> = {
             sendTo: sendToNumber,
             sendBody: notification.length > 2000 ? notification.slice(0, 1997) + "..." : notification,
             replyToSender: finalReply.length > 2000 ? finalReply.slice(0, 1997) + "..." : finalReply,
           };
+          if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
           process.stdout.write(JSON.stringify(payload) + "\n");
           appendConversation(owner, userMessage, finalReply);
           return;

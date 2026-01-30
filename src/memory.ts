@@ -32,9 +32,11 @@ type MemoryFile = {
 const DEFAULT_MEMORY_DIR = join(homedir(), ".bo");
 const DEFAULT_MEMORY_PATH = join(DEFAULT_MEMORY_DIR, "memory.json");
 
-/** Owner "default" = self / primary user. Other owners = canonical 10-digit (e.g. 7404749170). Uses central phone normalization. */
+/** Owner "default" = self / primary user. Other owners = canonical 10-digit or "telegram:<id>". Pass through telegram:<id>; do not map to default. */
 export function normalizeOwner(sender: string | undefined): string {
-  const c = canonicalPhone((sender ?? "").trim() || "default");
+  const trimmed = (sender ?? "").trim();
+  if (trimmed.startsWith("telegram:")) return trimmed;
+  const c = canonicalPhone(trimmed || "default");
   return c === "default" || c.length < 10 ? "default" : c;
 }
 

@@ -119,6 +119,19 @@ We are at a level where automated tests are warranted. Focus on logic that can b
 
 ---
 
+## How to get your Telegram ID
+
+Your **Telegram username** (e.g. @jonhogue) is not the same as your **Telegram ID** (a numeric id the bot uses). To get your ID:
+
+1. Start the daemon with `BO_TELEGRAM_BOT_TOKEN` set (`npm run watch-self`).
+2. In Telegram, open a chat with your bot (search by the bot username you chose in BotFather).
+3. Send **`/myid`** or **`/start`** or **`/id`**.
+4. The bot replies with: *Your Telegram ID is `123456789`. Add this to your user in the admin (users.telegram_id) to use the agent.*
+5. In the admin UI (http://localhost:3847), open the **users** table, find your row, set **telegram_id** to that number (e.g. `123456789`). Save.
+6. From then on, messages from that Telegram account are treated as that user (same facts, conversation, skills as that user).
+
+---
+
 ## Optional: Linking Telegram to Existing User
 
 Unknown Telegram messages are logged (telegram_id, text, timestamp). Example: “this is Cara” from telegram_id 12345. To link that ID to Cara: in the admin UI, open `users`, find Cara’s row, set `telegram_id` to `12345`. That Telegram ID is then allowed and gets Cara’s facts/conversation when they message the bot.
