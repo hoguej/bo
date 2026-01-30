@@ -21,6 +21,7 @@ import {
   upsertFact,
 } from "../src/memory";
 import { getContactsList, getNameToNumber, getNumberToName, resolveContactToNumber } from "../src/contacts";
+import { dbGetConfig } from "../src/db";
 import {
   getAllowedSkillIdsForOwner,
   getSkillById,
@@ -125,7 +126,7 @@ function buildContext() {
     to: getEnv("BO_REQUEST_TO"),
     isSelfChat: getEnv("BO_REQUEST_IS_SELF_CHAT"),
     isFromMe: getEnv("BO_REQUEST_IS_FROM_ME"),
-    default_zip: getEnv("BO_DEFAULT_ZIP") || undefined,
+    default_zip: dbGetConfig("default_zip") || getEnv("BO_DEFAULT_ZIP") || undefined,
   };
 }
 
@@ -230,7 +231,7 @@ async function main() {
     process.stdout.write(randomExcuse());
     process.exit(0);
   }
-  const model = getEnv("BO_LLM_MODEL") ?? "openai/gpt-4.1";
+  const model = dbGetConfig("llm_model") || getEnv("BO_LLM_MODEL") || "openai/gpt-4.1";
 
   const userMessage = process.argv.slice(2).join(" ").trim();
   if (!userMessage) {

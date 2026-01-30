@@ -2,7 +2,13 @@ import type { IMessageSDK } from "@photon-ai/imessage-kit";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { getNumberToName } from "../contacts";
-import { dbHasRepliedToMessage, dbMarkMessageReplied } from "../db";
+import {
+  dbGetConfig,
+  dbGetPhoneNumbersThatCanTriggerAgent,
+  dbGetPrimaryUserPhone,
+  dbHasRepliedToMessage,
+  dbMarkMessageReplied,
+} from "../db";
 import { canonicalPhone, toE164 } from "../phone";
 
 /** Message-like object from watcher or getMessages (minimal shape we use). */
@@ -21,10 +27,16 @@ function newRequestId(): string {
   return randomBytes(4).toString("hex");
 }
 
-const SELF_HANDLE = process.env.BO_MY_PHONE ?? process.env.BO_MY_EMAIL;
+function getSelfHandle(): string | undefined {
+  const p = dbGetPrimaryUserPhone();
+  if (p) return toE164(p);
+  return process.env.BO_MY_PHONE ?? process.env.BO_MY_EMAIL ?? undefined;
+}
 
 /** Script or command that receives the message as first arg and prints the response to stdout. */
-const AGENT_SCRIPT = process.env.BO_AGENT_SCRIPT?.trim();
+function getAgentScript(): string | undefined {
+  return dbGetConfig("agent_script")?.trim() ?? process.env.BO_AGENT_SCRIPT?.trim() ?? undefined;
+}
 
 /** Message guids we sent (our replies). Never react to these. */
 const sentMessageGuids = new Set<string>();
@@ -61,8 +73,10 @@ function senderDisplay(sender: string): string {
   return name ? `${name} (${canonical})` : sender;
 }
 
-/** Optional: when any of these numbers send a message, we pass it to the agent and reply (any chat). Comma-separated. */
+/** Optional: when any of these numbers send a message, we pass it to the agent and reply (any chat). From users.can_trigger_agent or env. */
 function getAgentNumbers(): Set<string> {
+  const fromDb = dbGetPhoneNumbersThatCanTriggerAgent();
+  if (fromDb.length > 0) return new Set(fromDb);
   const raw = process.env.BO_AGENT_NUMBERS ?? process.env.BO_AGENT_NUMBER ?? "";
   const set = new Set<string>();
   for (const s of raw.split(",")) {
@@ -79,8 +93,9 @@ function isFromAgentNumber(sender: string): boolean {
 }
 
 function isSelfChat(chatId: string): boolean {
-  if (!SELF_HANDLE) return false;
-  return chatId === SELF_HANDLE || chatId.endsWith(SELF_HANDLE) || chatId.includes(SELF_HANDLE);
+  const self = getSelfHandle();
+  if (!self) return false;
+  return chatId === self || chatId.endsWith(self) || chatId.includes(self);
 }
 
 /** Ensure we never send a message that starts with "Bo" (so we don't trigger ourselves). */
@@ -94,16 +109,17 @@ function sanitizeReply(reply: string): string {
 
 function runAgent(message: string, ctxEnv: Record<string, string>): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    if (!AGENT_SCRIPT) {
+    const script = getAgentScript();
+    if (!script) {
       resolve({
         stdout: "",
-        stderr: "Set BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.",
+        stderr: "Set config agent_script in admin or BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.",
         code: 1,
       });
       return;
     }
     // Don't use shell: true—apostrophes etc. in the message would break the command. Pass args directly.
-    const proc = spawn("/bin/bash", [AGENT_SCRIPT, message], {
+    const proc = spawn("/bin/bash", [script, message], {
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, ...ctxEnv },
@@ -202,7 +218,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
   if (isSelf) {
     if (!text.toLowerCase().startsWith("bo")) return;
     messageToAgent = text.slice(2).trim();
-    replyTo = SELF_HANDLE!;
+    replyTo = getSelfHandle()!;
   } else if (isFromAllowed) {
     if (!text.toLowerCase().startsWith("bo") || !text.slice(2).trim()) return;
     messageToAgent = text.slice(2).trim();
@@ -222,7 +238,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
     recentlyProcessedBodies.delete(old);
   }
 
-  const senderKey = isSelf ? canonicalPhone(SELF_HANDLE ?? "") || "self" : canonicalPhone(msg.sender ?? "");
+  const senderKey = isSelf ? canonicalPhone(getSelfHandle() ?? "") || "self" : canonicalPhone(msg.sender ?? "");
   const dedupeKey = `${senderKey}:${messageToAgent}`;
   if (processedMessageKeys.has(dedupeKey)) return;
   processedMessageKeys.add(dedupeKey);
@@ -351,13 +367,13 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
 }
 
 export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<void> {
-  if (!SELF_HANDLE) {
-    console.error("Set BO_MY_PHONE or BO_MY_EMAIL so we know the self-chat. Example: BO_MY_PHONE=+1234567890");
+  if (!getSelfHandle()) {
+    console.error("Set config primary_user_id in admin, or BO_MY_PHONE or BO_MY_EMAIL for self-chat. Example: BO_MY_PHONE=+1234567890");
     process.exit(1);
   }
 
-  if (!AGENT_SCRIPT) {
-    console.error("Set BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.");
+  if (!getAgentScript()) {
+    console.error("Set config agent_script in admin or BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.");
     process.exit(1);
   }
 

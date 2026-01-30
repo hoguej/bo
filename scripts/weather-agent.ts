@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { dbGetConfig } from "../src/db";
 import { getTomorrowForecastFromZip } from "./weather-gov";
 
 function getEnv(name: string): string | undefined {
@@ -20,11 +21,12 @@ async function main() {
 
   const zip =
     extractZip(msg) ??
+    dbGetConfig("default_zip") ??
     getEnv("BO_DEFAULT_ZIP") ??
     getEnv("BO_ZIP") ??
     getEnv("HOME_ZIP");
   if (!zip) {
-    process.stdout.write("What ZIP code should I use? (You can set BO_DEFAULT_ZIP to avoid this.)");
+    process.stdout.write("What ZIP code should I use? (Set config default_zip in admin or BO_DEFAULT_ZIP to avoid this.)");
     return;
   }
 
@@ -34,7 +36,7 @@ async function main() {
     process.exit(1);
   }
 
-  const model = getEnv("BO_LLM_MODEL") ?? "openai/gpt-4.1";
+  const model = dbGetConfig("llm_model") || getEnv("BO_LLM_MODEL") || "openai/gpt-4.1";
   const openai = new OpenAI({
     apiKey,
     baseURL: "https://ai-gateway.vercel.sh/v1",

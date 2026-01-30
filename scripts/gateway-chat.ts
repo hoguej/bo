@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { dbGetConfig } from "../src/db";
 import { formatFactsForPrompt, getRelevantFacts } from "../src/memory";
 
 function getEnv(name: string): string | undefined {
@@ -13,7 +14,7 @@ async function main() {
     process.exit(1);
   }
 
-  const model = getEnv("BO_LLM_MODEL") ?? "openai/gpt-4.1";
+  const model = dbGetConfig("llm_model") || getEnv("BO_LLM_MODEL") || "openai/gpt-4.1";
 
   const prompt = process.argv.slice(2).join(" ").trim();
   if (!prompt) {

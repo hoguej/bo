@@ -1,3 +1,4 @@
+import { dbGetConfig } from "../../src/db";
 import { getTomorrowForecastFromZip } from "../weather-gov";
 
 type Input = { zip?: string };
@@ -26,9 +27,14 @@ function extractZip(s?: string): string | null {
 
 async function main() {
   const input = (await readJsonStdin()) as Input;
-  const zip = extractZip(input.zip) ?? process.env.BO_DEFAULT_ZIP ?? process.env.BO_ZIP ?? process.env.HOME_ZIP;
+  const zip =
+    extractZip(input.zip) ??
+    dbGetConfig("default_zip") ??
+    process.env.BO_DEFAULT_ZIP ??
+    process.env.BO_ZIP ??
+    process.env.HOME_ZIP;
   if (!zip) {
-    console.error("Missing zip. Provide {\"zip\":\"43130\"} or set BO_DEFAULT_ZIP.");
+    console.error("Missing zip. Provide {\"zip\":\"43130\"} or set config default_zip or BO_DEFAULT_ZIP.");
     process.exit(1);
   }
 

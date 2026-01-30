@@ -1,3 +1,4 @@
+import { dbGetConfig } from "../../src/db";
 import {
   getDailyForecastFromZip,
   getHourlyForecastFromZip,
@@ -117,12 +118,13 @@ async function main() {
   const input = (await readJsonStdin()) as Input;
   const zip =
     extractZip(input.location) ??
+    dbGetConfig("default_zip") ??
     process.env.BO_DEFAULT_ZIP ??
     process.env.BO_ZIP ??
     process.env.HOME_ZIP;
   if (!zip) {
     console.error(
-      'Missing location. Provide {"location":"43130"} or {"location":"Columbus 43130"} or set BO_DEFAULT_ZIP.'
+      'Missing location. Provide {"location":"43130"} or {"location":"Columbus 43130"} or set config default_zip or BO_DEFAULT_ZIP.'
     );
     process.exit(1);
   }

@@ -5,6 +5,9 @@
  * Left: table list. Right: query editor + result table. FK cells clickable for drill-down.
  */
 
+import { loadEnv } from "../src/env";
+loadEnv(process.cwd());
+
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {

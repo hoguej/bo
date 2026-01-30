@@ -10,6 +10,12 @@ Each requirement is a discrete, testable prompt. IDs are stable for traceability
 
 ### Setup & configuration
 
+**Getting a bot token**
+
+1. In Telegram, open a chat with [@BotFather](https://t.me/BotFather).
+2. Send `/newbot` and follow the prompts (bot name, then username; username must end in `bot`).
+3. BotFather replies with a token like `123456789:ABCdefGHI...`. **Keep it secret**; do not commit it. Put it in `.env.local` as `BO_TELEGRAM_BOT_TOKEN=<your token>`.
+
 | ID | Requirement / Prompt |
 |----|----------------------|
 | **TG-001** | Bot token is the only Telegram config in env. Document in `.env.local.example`: `BO_TELEGRAM_BOT_TOKEN=<token from BotFather>`. No other Telegram-related env vars for allowlist or config. |

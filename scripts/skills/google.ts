@@ -3,6 +3,7 @@
  * Flow: user query → AI picks function + params → run gog wrapper → AI formats reply.
  */
 
+import { dbGetConfig } from "../../src/db";
 import OpenAI from "openai";
 import {
   searchEmail,
@@ -381,7 +382,10 @@ async function main() {
     logErr("Missing AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN for Google skill.");
     process.exit(1);
   }
-  const model = getEnv("BO_LLM_MODEL") ?? "openai/gpt-4.1";
+  const model =
+    dbGetConfig("llm_model") ??
+    getEnv("BO_LLM_MODEL") ??
+    "openai/gpt-4.1";
   const openai = new OpenAI({ apiKey, baseURL: "https://ai-gateway.vercel.sh/v1" });
 
   const functionsBlob = FUNCTION_DEFS.map(

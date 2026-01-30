@@ -103,9 +103,15 @@ function initSchema(database: import("bun:sqlite").Database): void {
       message_guid TEXT NOT NULL PRIMARY KEY,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS config (
+      key TEXT NOT NULL PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
   migrateOldTablesToUsers(database);
   migrateOwnerColumnsToUserId(database);
+  migrateUsersAddCanTriggerAgent(database);
   database.run("DROP TABLE IF EXISTS inferences");
   migrateFromJson(database, false);
   database.run("CREATE INDEX IF NOT EXISTS idx_facts_user_id ON facts(user_id)");
@@ -113,6 +119,62 @@ function initSchema(database: import("bun:sqlite").Database): void {
   database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
   normalizeUserPhoneNumbers(database);
+  seedConfigFromEnv(database);
+}
+
+/** One-time seed: copy BO_* env vars into config and users so you don't have to type them in the admin. */
+function seedConfigFromEnv(database: import("bun:sqlite").Database): void {
+  function getConfig(key: string): string | undefined {
+    const row = database.query("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined;
+    const v = row?.value?.trim();
+    return v || undefined;
+  }
+  function setConfig(key: string, value: string): void {
+    if (!value?.trim()) return;
+    database.run("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", [key, value.trim()]);
+  }
+  function findOrCreateUserByPhone(phoneCanonical: string): number | undefined {
+    if (!phoneCanonical || phoneCanonical === "default" || phoneCanonical.length < 10) return undefined;
+    let row = database.query("SELECT id FROM users WHERE phone_number = ?").get(phoneCanonical) as { id: number } | undefined;
+    if (row) return row.id;
+    database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", phoneCanonical]);
+    row = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
+    return row?.id;
+  }
+
+  if (!getConfig("primary_user_id")) {
+    const raw = process.env.BO_MY_PHONE?.trim() || process.env.BO_MY_EMAIL?.trim();
+    if (raw) {
+      const can = canonicalPhone(raw);
+      const id = findOrCreateUserByPhone(can);
+      if (id != null) setConfig("primary_user_id", String(id));
+    }
+  }
+  if (!getConfig("default_zip") && process.env.BO_DEFAULT_ZIP?.trim()) {
+    setConfig("default_zip", process.env.BO_DEFAULT_ZIP.trim());
+  }
+  if (!getConfig("llm_model") && process.env.BO_LLM_MODEL?.trim()) {
+    setConfig("llm_model", process.env.BO_LLM_MODEL.trim());
+  }
+  if (!getConfig("agent_script") && process.env.BO_AGENT_SCRIPT?.trim()) {
+    setConfig("agent_script", process.env.BO_AGENT_SCRIPT.trim());
+  }
+  const agentRaw = process.env.BO_AGENT_NUMBERS?.trim() || process.env.BO_AGENT_NUMBER?.trim();
+  if (agentRaw) {
+    for (const s of agentRaw.split(",")) {
+      const can = canonicalPhone(s.trim());
+      const id = findOrCreateUserByPhone(can);
+      if (id != null) database.run("UPDATE users SET can_trigger_agent = 1 WHERE id = ?", [id]);
+    }
+  }
+}
+
+/** One-time: add can_trigger_agent to users (who can trigger the agent in watch-self). */
+function migrateUsersAddCanTriggerAgent(database: import("bun:sqlite").Database): void {
+  const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
+  if (cols.some((c) => c.name === "can_trigger_agent")) return;
+  database.run("ALTER TABLE users ADD COLUMN can_trigger_agent INTEGER NOT NULL DEFAULT 1");
+  database.run("UPDATE users SET can_trigger_agent = 0 WHERE phone_number = 'default'");
 }
 
 /** One-time: normalize existing users.phone_number to canonical form (10-digit) so lookups match. */
@@ -639,6 +701,38 @@ export function dbSetContacts(entries: Array<{ name: string; number: string }>):
     const last = rest.join(" ").trim();
     stmt.run(first, last, num);
   }
+}
+
+// --- Config (key/value: default_zip, llm_model, primary_user_id, etc.) ---
+export function dbGetConfig(key: string): string | undefined {
+  const database = getDb();
+  const row = database.query("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function dbSetConfig(key: string, value: string): void {
+  const database = getDb();
+  database.run("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", [key, String(value)]);
+}
+
+/** Primary user's phone (for self-chat / send-self). From config.primary_user_id -> users.phone_number, or undefined. */
+export function dbGetPrimaryUserPhone(): string | undefined {
+  const idStr = dbGetConfig("primary_user_id");
+  if (!idStr?.trim()) return undefined;
+  const id = parseInt(idStr.trim(), 10);
+  if (Number.isNaN(id)) return undefined;
+  const database = getDb();
+  const row = database.query("SELECT phone_number FROM users WHERE id = ?").get(id) as { phone_number: string } | undefined;
+  return row?.phone_number;
+}
+
+/** Phone numbers that can trigger the agent (watch-self). From users where can_trigger_agent = 1. */
+export function dbGetPhoneNumbersThatCanTriggerAgent(): string[] {
+  const database = getDb();
+  const rows = database
+    .query("SELECT phone_number FROM users WHERE can_trigger_agent = 1 AND phone_number != 'default'")
+    .all() as { phone_number: string }[];
+  return rows.map((r) => canonicalPhone(r.phone_number)).filter((n) => n.length >= 10);
 }
 
 // --- Watch-self: which incoming messages we've already replied to (persistent, survives restart) ---
