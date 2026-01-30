@@ -499,6 +499,74 @@ export function dbGetRowByColumn(tableName: string, column: string, value: unkno
   return row ?? null;
 }
 
+/** Get users by ids for admin UI (display "Name (id)" for user_id FKs). */
+export function dbGetUsersByIds(ids: number[]): Array<{ id: number; first_name: string; last_name: string }> {
+  if (ids.length === 0) return [];
+  const database = getDb();
+  const placeholders = ids.map(() => "?").join(",");
+  return database.query(`SELECT id, first_name, last_name FROM users WHERE id IN (${placeholders})`).all(...ids) as Array<{ id: number; first_name: string; last_name: string }>;
+}
+
+/** Primary key column names for a table (ordered by pk). */
+export function dbGetPkColumns(tableName: string): string[] {
+  const cols = dbGetTableInfo(tableName);
+  return cols.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name);
+}
+
+/** Insert a row; returns lastInsertRowid or error. */
+export function dbInsertRow(tableName: string, data: Record<string, unknown>): { lastId?: number; error?: string } {
+  const database = getDb();
+  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
+  if (safe !== tableName) return { error: "Invalid table name" };
+  const entries = Object.entries(data).filter(([, v]) => v !== undefined) as [string, unknown][];
+  const cols = entries.map(([k]) => k.replace(/[^a-zA-Z0-9_]/g, "")).filter((c) => c.length > 0);
+  if (entries.length !== cols.length || cols.some((c) => c.length === 0)) return { error: "Invalid column name" };
+  const values = entries.map(([, v]) => v);
+  try {
+    const result = database.run(`INSERT INTO ${safe} (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`, ...values) as { lastInsertRowid?: number };
+    return { lastId: result.lastInsertRowid ?? undefined };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+/** Update row by primary key. */
+export function dbUpdateRow(tableName: string, pk: Record<string, unknown>, data: Record<string, unknown>): { changes?: number; error?: string } {
+  const database = getDb();
+  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
+  if (safe !== tableName) return { error: "Invalid table name" };
+  const pkCols = dbGetPkColumns(tableName);
+  if (pkCols.length === 0) return { error: "No primary key" };
+  const setCols = Object.keys(data).filter((k) => data[k] !== undefined && !pkCols.includes(k)).map((k) => k.replace(/[^a-zA-Z0-9_]/g, ""));
+  if (setCols.length === 0) return { error: "No columns to update" };
+  const setClause = setCols.map((c) => `${c} = ?`).join(", ");
+  const whereClause = pkCols.map((c) => `${c} = ?`).join(" AND ");
+  const values = [...setCols.map((c) => data[c]), ...pkCols.map((c) => pk[c])];
+  try {
+    const result = database.run(`UPDATE ${safe} SET ${setClause} WHERE ${whereClause}`, ...values) as { changes?: number };
+    return { changes: result.changes ?? 0 };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+/** Delete row by primary key. */
+export function dbDeleteRow(tableName: string, pk: Record<string, unknown>): { changes?: number; error?: string } {
+  const database = getDb();
+  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
+  if (safe !== tableName) return { error: "Invalid table name" };
+  const pkCols = dbGetPkColumns(tableName);
+  if (pkCols.length === 0) return { error: "No primary key" };
+  const whereClause = pkCols.map((c) => `${c} = ?`).join(" AND ");
+  const values = pkCols.map((c) => pk[c]);
+  try {
+    const result = database.run(`DELETE FROM ${safe} WHERE ${whereClause}`, ...values) as { changes?: number };
+    return { changes: result.changes ?? 0 };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
 // --- Users (contacts) ---
 function userDisplayName(first: string, last: string): string {
   return [first, last].map((s) => s.trim()).filter(Boolean).join(" ") || "";

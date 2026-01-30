@@ -11,8 +11,13 @@ import {
   dbGetTables,
   dbGetTableInfo,
   dbGetForeignKeys,
+  dbGetPkColumns,
   dbRunQuery,
   dbGetRowByColumn,
+  dbGetUsersByIds,
+  dbInsertRow,
+  dbUpdateRow,
+  dbDeleteRow,
 } from "../src/db";
 
 const PORT = parseInt(process.env.BO_ADMIN_PORT ?? "3847", 10);
@@ -87,6 +92,40 @@ const server = {
         const row = dbGetRowByColumn(table!, column!, useValue);
         return json({ row: row ?? null });
       }
+    }
+
+    if (!handler && method === "GET" && path.startsWith("/api/db/users")) {
+      const idsParam = url.searchParams.get("ids") ?? "";
+      const ids = idsParam.split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !Number.isNaN(n));
+      const users = dbGetUsersByIds(ids);
+      return json({ users });
+    }
+
+    if (!handler && method === "POST" && path.startsWith("/api/db/row/")) {
+      const table = path.slice("/api/db/row/".length).split("/")[0] ?? "";
+      const body = (await req.json()) as Record<string, unknown>;
+      if (!body || typeof body !== "object") return err("body required");
+      const result = dbInsertRow(table, body);
+      if (result.error) return err(result.error, 400);
+      return json({ ok: true, lastId: result.lastId });
+    }
+
+    if (!handler && method === "PATCH" && path.startsWith("/api/db/row/")) {
+      const table = path.slice("/api/db/row/".length).split("/")[0] ?? "";
+      const body = (await req.json()) as { pk?: Record<string, unknown>; data?: Record<string, unknown> };
+      if (!body?.pk || !body?.data) return err("pk and data required");
+      const result = dbUpdateRow(table, body.pk, body.data);
+      if (result.error) return err(result.error, 400);
+      return json({ ok: true, changes: result.changes });
+    }
+
+    if (!handler && method === "DELETE" && path.startsWith("/api/db/row/")) {
+      const table = path.slice("/api/db/row/".length).split("/")[0] ?? "";
+      const body = (await req.json()) as { pk?: Record<string, unknown> };
+      if (!body?.pk) return err("pk required");
+      const result = dbDeleteRow(table, body.pk);
+      if (result.error) return err(result.error, 400);
+      return json({ ok: true, changes: result.changes });
     }
 
     if (handler) {

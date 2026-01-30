@@ -38,6 +38,17 @@
     .row-detail pre { margin: 0; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
     .breadcrumb { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem; }
     .breadcrumb strong { color: var(--text); }
+    button.danger { background: var(--danger); color: #fff; border: none; padding: 0.25rem 0.5rem; border-radius: 4px; cursor: pointer; font-size: 11px; }
+    button.danger:hover { filter: brightness(1.1); }
+    .table-actions { margin-bottom: 0.5rem; display: flex; gap: 0.5rem; align-items: center; }
+    .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 10; }
+    .modal-overlay.visible { display: flex; }
+    .modal { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; max-width: 90vw; max-height: 85vh; overflow: auto; }
+    .modal h3 { margin: 0 0 1rem; color: var(--accent); }
+    .modal .form-row { margin-bottom: 0.5rem; }
+    .modal .form-row label { display: inline-block; min-width: 120px; color: var(--muted); font-size: 12px; }
+    .modal .form-row input, .modal .form-row textarea { width: 100%; max-width: 400px; }
+    .modal-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
   </style>
 </head>
 <body>
@@ -57,6 +68,9 @@
       </div>
     </div>
     <div class="result-wrap">
+      <div class="table-actions" id="table-actions" style="display:none;">
+        <button class="primary" id="new-row-btn">New row</button>
+      </div>
       <table class="data-table" id="result-table" style="display:none;">
         <thead id="result-thead"></thead>
         <tbody id="result-tbody"></tbody>
@@ -66,6 +80,17 @@
     <div id="row-detail" class="row-detail" style="display:none;">
       <h3 id="row-detail-title"></h3>
       <pre id="row-detail-body"></pre>
+    </div>
+
+    <div id="row-modal" class="modal-overlay">
+      <div class="modal">
+        <h3 id="row-modal-title">Row</h3>
+        <div id="row-modal-fields"></div>
+        <div class="modal-actions">
+          <button class="primary" id="row-modal-save">Save</button>
+          <button id="row-modal-cancel">Cancel</button>
+        </div>
+      </div>
     </div>
   </main>
 
@@ -150,6 +175,10 @@
       }
     }
 
+    function pkColumns() {
+      return (schema.columns || []).filter(c => c.pk > 0).sort((a, b) => a.pk - b.pk).map(c => c.name);
+    }
+
     function fkForColumn(col) {
       const explicit = schema.foreignKeys.find(fk => fk.from === col);
       if (explicit) return explicit;
@@ -161,36 +190,140 @@
       return null;
     }
 
+    async function fetchUserLabels(columns, rows) {
+      const userFkCols = columns.filter(c => { const fk = fkForColumn(c); return fk && fk.table === "users"; });
+      if (userFkCols.length === 0) return {};
+      const ids = new Set();
+      rows.forEach(row => userFkCols.forEach(col => { const v = row[col]; if (v !== null && v !== undefined && v !== "") ids.add(Number(v)); }));
+      if (ids.size === 0) return {};
+      const j = await api("GET", "/api/db/users?ids=" + Array.from(ids).join(","));
+      const users = j.users || [];
+      const map = {};
+      users.forEach(u => { const name = [u.first_name, u.last_name].map(s => (s || "").trim()).filter(Boolean).join(" ") || "(no name)"; map[u.id] = name; });
+      return map;
+    }
+
     function renderResult(columns, rows) {
       const thead = document.getElementById("result-thead");
       const tbody = document.getElementById("result-tbody");
       const tableEl = document.getElementById("result-table");
+      const actionsEl = document.getElementById("table-actions");
       tableEl.style.display = "block";
-      thead.innerHTML = "<tr>" + columns.map(c => `<th>${escapeHtml(c)}</th>`).join("") + "</tr>";
+      actionsEl.style.display = selectedTable ? "block" : "none";
+      const pkCols = pkColumns();
+      thead.innerHTML = "<tr>" + columns.map(c => `<th>${escapeHtml(c)}</th>`).join("") + "<th>Actions</th></tr>";
       if (rows.length === 0) {
-        tbody.innerHTML = "<tr><td colspan='" + columns.length + "' class='empty'>No rows</td></tr>";
+        tbody.innerHTML = "<tr><td colspan='" + (columns.length + 1) + "' class='empty'>No rows</td></tr>";
         return;
       }
-      tbody.innerHTML = rows.map(row => {
-        return "<tr>" + columns.map(col => {
-          const val = row[col];
-          const fk = fkForColumn(col);
-          const display = val === null || val === undefined ? "" : String(val);
-          if (fk && (display !== "" || val === 0)) {
-            return `<td class="fk" data-fk-table="${escapeHtml(fk.table)}" data-fk-column="${escapeHtml(fk.to)}" data-fk-value="${escapeHtml(display)}" title="View ${escapeHtml(fk.table)}.${escapeHtml(fk.to)} = ${escapeHtml(display)}">${escapeHtml(display)}</td>`;
-          }
-          return `<td>${escapeHtml(display)}</td>`;
-        }).join("") + "</tr>";
-      }).join("");
+      function paintRows(userLabel) {
+        tbody.innerHTML = rows.map((row, rowIndex) => {
+          const cells = columns.map(col => {
+            const val = row[col];
+            const fk = fkForColumn(col);
+            let display = val === null || val === undefined ? "" : String(val);
+            if (fk && fk.table === "users" && (display !== "" || val === 0)) {
+              const name = userLabel[Number(val)] || "";
+              display = name ? name + " (" + val + ")" : display;
+            }
+            if (fk && (display !== "" || val === 0)) {
+              const rawVal = val === null || val === undefined ? "" : String(val);
+              return `<td class="fk" data-fk-table="${escapeHtml(fk.table)}" data-fk-column="${escapeHtml(fk.to)}" data-fk-value="${escapeHtml(rawVal)}" title="View ${escapeHtml(fk.table)}.${escapeHtml(fk.to)} = ${escapeHtml(rawVal)}">${escapeHtml(display)}</td>`;
+            }
+            return `<td>${escapeHtml(display)}</td>`;
+          });
+          cells.push(`<td><button class="primary" data-row-index="${rowIndex}" data-action="edit">Edit</button> <button class="danger" data-row-index="${rowIndex}" data-action="delete">Delete</button></td>`);
+          return "<tr>" + cells.join("") + "</tr>";
+        }).join("");
 
-      tbody.querySelectorAll("td.fk").forEach(td => {
-        td.addEventListener("click", () => {
-          const table = td.dataset.fkTable;
-          const column = td.dataset.fkColumn;
-          const value = td.dataset.fkValue;
-          loadRowDetail(table, column, value);
+        tbody.querySelectorAll("td.fk").forEach(td => {
+          td.addEventListener("click", () => {
+            const table = td.dataset.fkTable;
+            const column = td.dataset.fkColumn;
+            const value = td.dataset.fkValue;
+            loadRowDetail(table, column, value);
+          });
         });
-      });
+        tbody.querySelectorAll("button[data-action=edit]").forEach(btn => {
+          btn.addEventListener("click", () => openEditModal(parseInt(btn.dataset.rowIndex, 10)));
+        });
+        tbody.querySelectorAll("button[data-action=delete]").forEach(btn => {
+          btn.addEventListener("click", () => deleteRow(parseInt(btn.dataset.rowIndex, 10)));
+        });
+      }
+
+      fetchUserLabels(columns, rows).then(paintRows).catch(() => paintRows({}));
+    }
+
+    function openNewModal() {
+      document.getElementById("row-modal-title").textContent = "New row – " + selectedTable;
+      const fieldsEl = document.getElementById("row-modal-fields");
+      fieldsEl.innerHTML = (schema.columns || []).map(c => {
+        const val = c.dflt_value !== null && c.dflt_value !== undefined ? String(c.dflt_value).replace(/^'|'$/g, "") : "";
+        return `<div class="form-row"><label>${escapeHtml(c.name)}</label><input name="${escapeHtml(c.name)}" value="${escapeHtml(val)}" /></div>`;
+      }).join("");
+      document.getElementById("row-modal").dataset.mode = "new";
+      document.getElementById("row-modal").classList.add("visible");
+    }
+
+    function openEditModal(rowIndex) {
+      const row = lastResult.rows[rowIndex];
+      if (!row) return;
+      document.getElementById("row-modal-title").textContent = "Edit row – " + selectedTable;
+      const fieldsEl = document.getElementById("row-modal-fields");
+      const pkCols = pkColumns();
+      fieldsEl.innerHTML = (schema.columns || []).map(c => {
+        const val = row[c.name];
+        const v = val === null || val === undefined ? "" : String(val);
+        const readOnly = pkCols.includes(c.name) ? " readonly" : "";
+        return `<div class="form-row"><label>${escapeHtml(c.name)}</label><input name="${escapeHtml(c.name)}" value="${escapeHtml(v)}"${readOnly} /></div>`;
+      }).join("");
+      document.getElementById("row-modal").dataset.mode = "edit";
+      document.getElementById("row-modal").dataset.rowIndex = String(rowIndex);
+      document.getElementById("row-modal").classList.add("visible");
+    }
+
+    function closeRowModal() {
+      document.getElementById("row-modal").classList.remove("visible");
+    }
+
+    async function saveRowModal() {
+      const mode = document.getElementById("row-modal").dataset.mode;
+      const fieldsEl = document.getElementById("row-modal-fields");
+      const inputs = fieldsEl.querySelectorAll("input[name], textarea[name]");
+      const data = {};
+      inputs.forEach(inp => { data[inp.name] = inp.value === "" ? undefined : inp.value; });
+      try {
+        if (mode === "new") {
+          await api("POST", "/api/db/row/" + encodeURIComponent(selectedTable), data);
+          showMsg("query-msg", "Row created.");
+        } else {
+          const rowIndex = parseInt(document.getElementById("row-modal").dataset.rowIndex, 10);
+          const row = lastResult.rows[rowIndex];
+          const pkCols = pkColumns();
+          const pk = pkCols.reduce((o, k) => { o[k] = row[k]; return o; }, {});
+          await api("PATCH", "/api/db/row/" + encodeURIComponent(selectedTable), { pk, data });
+          showMsg("query-msg", "Row updated.");
+        }
+        closeRowModal();
+        runCurrentQuery();
+      } catch (e) {
+        showMsg("query-msg", e.message, true);
+      }
+    }
+
+    async function deleteRow(rowIndex) {
+      const row = lastResult.rows[rowIndex];
+      if (!row || !confirm("Delete this row?")) return;
+      const pkCols = pkColumns();
+      const pk = pkCols.reduce((o, k) => { o[k] = row[k]; return o; }, {});
+      try {
+        await api("DELETE", "/api/db/row/" + encodeURIComponent(selectedTable), { pk });
+        showMsg("query-msg", "Row deleted.");
+        runCurrentQuery();
+      } catch (e) {
+        showMsg("query-msg", e.message, true);
+      }
     }
 
     async function loadRowDetail(table, column, value) {
@@ -210,6 +343,11 @@
     }
 
     document.getElementById("run-query").addEventListener("click", () => runCurrentQuery());
+
+    document.getElementById("new-row-btn").addEventListener("click", () => openNewModal());
+    document.getElementById("row-modal-save").addEventListener("click", () => saveRowModal());
+    document.getElementById("row-modal-cancel").addEventListener("click", () => closeRowModal());
+    document.getElementById("row-modal").addEventListener("click", (e) => { if (e.target.id === "row-modal") closeRowModal(); });
 
     document.getElementById("reset-query").addEventListener("click", () => {
       if (selectedTable) {
