@@ -1,18 +1,25 @@
 /**
  * Todo skill: per-person todo lists. Add, list, mark done, remove, edit, set due.
  * Owner = sender (my list) or contact name (Carrie's list). List shows #1, #2, #3.
+ * Data stored in ~/.bo/bo.db (SQLite).
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import {
+  dbAddTodo,
+  dbDeleteTodo,
+  dbGetTodos,
+  dbUpdateTodoDone,
+  dbUpdateTodoDue,
+  dbUpdateTodoText,
+} from "../../src/db";
 import { getNameToNumber, getNumberToName } from "../../src/contacts";
 import { normalizeOwner } from "../../src/memory";
 
 type Todo = {
+  id: number;
   text: string;
   done: boolean;
-  due?: string;
+  due?: string | null;
   createdAt: string;
 };
 
@@ -24,38 +31,15 @@ type Input = {
   due?: string;
 };
 
-function getTodosPath(owner: string): string {
-  const baseDir = process.env.BO_MEMORY_PATH?.trim()
-    ? dirname(process.env.BO_MEMORY_PATH)
-    : join(homedir(), ".bo");
-  const fileName = owner === "default" ? "todos.json" : `todos_${owner}.json`;
-  return join(baseDir, fileName);
-}
-
 function loadTodos(owner: string): Todo[] {
-  const path = getTodosPath(owner);
-  if (!existsSync(path)) return [];
-  try {
-    const raw = readFileSync(path, "utf-8");
-    const arr = JSON.parse(raw) as unknown;
-    if (!Array.isArray(arr)) return [];
-    return arr.filter(
-      (t): t is Todo =>
-        t != null &&
-        typeof t === "object" &&
-        typeof (t as Todo).text === "string" &&
-        typeof (t as Todo).done === "boolean"
-    );
-  } catch {
-    return [];
-  }
-}
-
-function saveTodos(owner: string, todos: Todo[]): void {
-  const path = getTodosPath(owner);
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(path, JSON.stringify(todos, null, 2), "utf-8");
+  const rows = dbGetTodos(owner);
+  return rows.map((r) => ({
+    id: r.id,
+    text: r.text,
+    done: r.done !== 0,
+    due: r.due ?? undefined,
+    createdAt: r.createdAt,
+  }));
 }
 
 function resolveOwner(input: Input): { owner: string; displayName: string } {
@@ -117,7 +101,7 @@ async function main() {
   }
 
   const { owner, displayName } = resolveOwner(input);
-  let todos = loadTodos(owner);
+  const todos = loadTodos(owner);
 
   switch (action) {
     case "add": {
@@ -126,13 +110,7 @@ async function main() {
         process.stderr.write("todo skill: add requires text\n");
         process.exit(1);
       }
-      todos.push({
-        text,
-        done: false,
-        due: input.due?.trim() || undefined,
-        createdAt: new Date().toISOString(),
-      });
-      saveTodos(owner, todos);
+      dbAddTodo(owner, text, input.due?.trim() || null);
       const forWho = input.for_contact ? ` to ${displayName}'s list` : "";
       process.stdout.write(`Added "${text}"${forWho}.`);
       return;
@@ -150,9 +128,8 @@ async function main() {
         process.stdout.write(`No todo #${num ?? "?"}. Use a number from the list (e.g. #2).`);
         return;
       }
-      const idx = num - 1;
-      todos[idx]!.done = true;
-      saveTodos(owner, todos);
+      const todo = todos[num - 1]!;
+      dbUpdateTodoDone(owner, todo.id);
       const forWho = input.for_contact ? ` on ${displayName}'s list` : "";
       process.stdout.write(`Marked #${num} done${forWho}.`);
       return;
@@ -164,10 +141,9 @@ async function main() {
         process.stdout.write(`No todo #${num ?? "?"}. Use a number from the list.`);
         return;
       }
-      const idx = num - 1;
-      const removed = todos[idx]!.text;
-      todos.splice(idx, 1);
-      saveTodos(owner, todos);
+      const todo = todos[num - 1]!;
+      const removed = todo.text;
+      dbDeleteTodo(owner, todo.id);
       const forWho = input.for_contact ? ` from ${displayName}'s list` : "";
       process.stdout.write(`Removed #${num} "${removed}"${forWho}.`);
       return;
@@ -184,9 +160,8 @@ async function main() {
         process.stderr.write("todo skill: edit requires text (new content)\n");
         process.exit(1);
       }
-      const idx = num - 1;
-      todos[idx]!.text = newText;
-      saveTodos(owner, todos);
+      const todo = todos[num - 1]!;
+      dbUpdateTodoText(owner, todo.id, newText);
       const forWho = input.for_contact ? ` on ${displayName}'s list` : "";
       process.stdout.write(`Updated #${num} to "${newText}"${forWho}.`);
       return;
@@ -203,9 +178,8 @@ async function main() {
         process.stderr.write("todo skill: set_due requires due (e.g. 2025-01-30 or tomorrow)\n");
         process.exit(1);
       }
-      const idx = num - 1;
-      todos[idx]!.due = due;
-      saveTodos(owner, todos);
+      const todo = todos[num - 1]!;
+      dbUpdateTodoDue(owner, todo.id, due);
       const forWho = input.for_contact ? ` on ${displayName}'s list` : "";
       process.stdout.write(`Set #${num} due ${due}${forWho}.`);
       return;

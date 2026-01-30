@@ -27,6 +27,23 @@ You can still override with env vars when running a command.
 
 (Sending to yourself uses your phone number or email as the “buddy”; the Messages app doesn’t allow sending to the same Apple ID account directly.)
 
+## Data and configuration (SQLite)
+
+All non-secret data and config live in a single SQLite database:
+
+- **Path:** `~/.bo/bo.db` (override with `BO_DB_PATH`)
+- **Contents:** contacts, skills registry and access, memory (facts), conversation history, summary, personality instructions, and per-person todos.
+
+Passwords and API keys stay in `.env` / `.env.local`; only non-token config and data are stored in the DB.
+
+**Moving data from JSON into the DB:** Your data may still be in JSON files (`config/contacts.json`, `skills/registry.json`, `skills/access.json`, and under `~/.bo/`: `memory.json`, `conversation.json`, `summary.json`, `personality.json`, `todos.json`, plus per-owner variants like `memory_7404749170.json`). To move that data into the DB now:
+
+```bash
+bo migrate
+```
+
+This opens the DB (creating the schema if needed), copies all data from those JSON files into the DB (replacing existing DB contents for those tables), then exits. After that, the DB is the source of truth; the app reads and writes the DB, not the JSON files. Run `bo migrate` anytime you want to reload the DB from the current JSON files.
+
 ## Slash commands (Cursor agent)
 
 In Cursor chat: `/get-messages 20`, `/get-messages unread`, `/send-self <text>`, `/list-chats [N]`, `/react`, `/watch-self`. Defined in `.cursor/commands/`; they run the bo CLI from the project root.
@@ -40,6 +57,8 @@ In Cursor chat: `/get-messages 20`, `/get-messages unread`, `/send-self <text>`,
 | `bo list-chats` | List chats. Options: `--limit N`, `--unread` |
 | `bo react --list` | List messages that have tapback reactions. Sending reactions is not supported by the base kit (would need [advanced-imessage-kit](https://github.com/photon-hq/advanced-imessage-kit) or similar). |
 | `bo watch-self` | Watch self-chat for "Bo …" and (optional) BO_AGENT_NUMBER; pass the rest to BO_AGENT_SCRIPT and reply. Never replies with "Bo" or to its own messages. |
+| `bo migrate` | Move data from JSON files into `~/.bo/bo.db` (overwrites DB with JSON contents). |
+| `npm run admin` | Start local admin UI at http://localhost:3847 to browse and edit DB data (contacts, skills, facts, todos, etc.). |
 
 ## Self-chat watcher (like Moltbot/Clawdbot)
 
@@ -141,7 +160,7 @@ bun run src/cli.ts get-messages --limit 5
 
 ## Skill access (per-number)
 
-The router (used by the watch-self agent) can restrict which phone numbers can use which skills. Create `skills/access.json`:
+The router (used by the watch-self agent) can restrict which phone numbers can use which skills. Access is stored in `~/.bo/bo.db`. To load it from `skills/access.json`, run `bo migrate` to move that data into the DB (see [Data and configuration (SQLite)](#data-and-configuration-sqlite)). Example shape (e.g. in `skills/access.json` before running migrate):
 
 ```json
 {

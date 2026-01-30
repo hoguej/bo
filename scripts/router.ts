@@ -10,19 +10,15 @@ import {
   appendSummarySentence,
   formatConversationForPrompt,
   formatFactsForPrompt,
-  formatInferencesForPrompt,
   getAllFacts,
-  getAllInferences,
   getMemoryPathForOwner,
   getMaxConversationMessages,
   getPersonalityForPrompt,
   getRecentMessages,
   getRelevantFacts,
-  getRelevantInferences,
   getSummaryForPrompt,
   normalizeOwner,
   upsertFact,
-  upsertInference,
 } from "../src/memory";
 import { getNameToNumber, getNumberToName } from "../src/contacts";
 import {
@@ -34,14 +30,11 @@ import {
 
 type FactInput = { key: string; value: string; scope?: "user" | "global"; tags?: string[] };
 
-type InferenceInput = { key: string; value: string; basedOnKeys?: string[] };
-
 type RouterDecision = {
   action: "use_skill" | "respond" | "send_to_contact";
   skill_id?: string;
   skill_input?: Record<string, unknown>;
   save_facts?: FactInput[];
-  save_inferences?: InferenceInput[];
   summary_sentence?: string;
   personality_instruction?: string;
   conversation_starter?: string;
@@ -301,12 +294,10 @@ async function main() {
     }
   }
 
-  // For "what do you know about me?" pass all facts and inferences; otherwise relevant subset.
+  // For "what do you know about me?" pass all facts; otherwise relevant subset.
   const askingAboutMe = /what do you know|what (info|facts?) do you have|what do you have on me|tell me what you know about me|list (what you know|your facts)/i.test(userMessage);
   const facts = askingAboutMe ? getAllFacts({ path: memoryPath }) : getRelevantFacts(userMessage, { max: 12, path: memoryPath });
-  const inferences = askingAboutMe ? getAllInferences({ path: memoryPath }) : getRelevantInferences(userMessage, { max: 12, path: memoryPath });
   const factsBlock = formatFactsForPrompt(facts);
-  const inferencesBlock = formatInferencesForPrompt(inferences);
 
   // Last N-1 messages so current user message fits; we keep up to BO_CONVERSATION_MESSAGES (default 20) total.
   const maxMessages = getMaxConversationMessages();
@@ -319,9 +310,7 @@ async function main() {
     "",
     "You must return a SINGLE JSON object with no extra text.",
     "",
-    "Facts vs inferences: Facts are what the user explicitly stated. Inferences are things you derive from facts (e.g. 'my children are Cara and Robert' → fact; infer 'number of children: 2', 'Cara is female', 'Robert is male'). Store both: save_facts for explicit statements, save_inferences for derived conclusions. Use basedOnKeys in save_inferences to list fact keys the inference came from when relevant.",
-    "",
-    "Remember everything relevant about the user and their context. Save not only direct facts about the user (name, email, location) but any new information about their life: family members, ages (e.g. 'my kids are 9 and 16' → save children_ages or Cara_age, Robert_age), relationships, preferences, work, pets, where they live, etc. Use save_facts for what they stated (e.g. children_ages: '9 and 16', or Cara_age: 9, Robert_age: 16) and save_inferences for what you derive. This context is important for later replies.",
+    "Remember everything relevant about the user and their context. Save not only direct facts about the user (name, email, location) but any new information about their life: family members, ages (e.g. 'my kids are 9 and 16' → save children_ages or Cara_age, Robert_age), relationships, preferences, work, pets, where they live, etc. Use save_facts for what they stated (e.g. children_ages: '9 and 16', or Cara_age: 9, Robert_age: 16). This context is important for later replies.",
     "",
     "Decide whether to use a local skill (script) or respond normally.",
     "Prefer using a local skill when it can answer the user request more reliably than a general response (e.g. weather).",
@@ -338,18 +327,18 @@ async function main() {
     "",
     "Send to a contact: When the user asks to send something to a specific person, use action=send_to_contact. Set contact_name to the person's first name (exactly as in the contacts list) and reply_to_sender to a short confirmation (e.g. 'Sent that poem to Carrie.'). Two cases: (1) Skill-based content (e.g. weather): set skill_id and skill_input; we run the skill and send its output to the contact. (2) Content you compose (poem, joke, custom message): set send_body to the exact text to send to the contact—we send it as-is. Do NOT use action=respond with the poem/message in response_text; use send_to_contact with send_body so we actually send it to the contact. Only use send_to_contact for contacts in the contacts list.",
     "",
-    "If the user asks what you know about them: use action=respond and list both Facts and Inferences from the payload. If there are none, say you don't have any stored yet.",
+    "If the user asks what you know about them: use action=respond and list Facts from the payload. If there are none, say you don't have any stored yet.",
     "",
     "If the user asks what you can do or your capabilities: use action=respond and list each local skill by name and a one-line description, then add that you can also answer general questions.",
     "",
-    "If the user asks for a specific fact about them: use action=respond and answer from Facts and Inferences in the payload. Give a short, direct answer. If we don't have it, say you don't have it yet.",
+    "If the user asks for a specific fact about them: use action=respond and answer from Facts in the payload. Give a short, direct answer. If we don't have it, say you don't have it yet.",
     "",
     "If using a local skill: action=use_skill, skill_id from registry, skill_input with only needed parameters.",
     "If responding normally: action=respond, response_text (what to send back).",
     "",
-    "When the user states any personal or contextual info (about themselves, family, ages, relationships, preferences, life details): add to save_facts as {key, value, scope?, tags?}. When you infer something from facts (e.g. count, gender from name, ages): add to save_inferences as {key, value, basedOnKeys?}. Never invent facts; inferences must follow from stated facts.",
+    "When the user states any personal or contextual info (about themselves, family, ages, relationships, preferences, life details): add to save_facts as {key, value, scope?, tags?}. Never invent facts.",
     "",
-    "CRITICAL: Your response must be a single JSON object. It MUST always include 'action' (either 'use_skill', 'respond', or 'send_to_contact'). If you are only saving facts/inferences with no other reply, use action='respond' and set response_text to a short acknowledgment (e.g. 'Got it, I've noted that.'). Never omit action.",
+    "CRITICAL: Your response must be a single JSON object. It MUST always include 'action' (either 'use_skill', 'respond', or 'send_to_contact'). If you are only saving facts with no other reply, use action='respond' and set response_text to a short acknowledgment (e.g. 'Got it, I've noted that.'). Never omit action.",
     "",
     "Optional: To improve long-term memory without expanding context, you may add summary_sentence: one short sentence summarizing this exchange for prior-context (e.g. 'User shared that Cara is 9.' or 'User asked about weather for 43130.'). We append it to a running summary. Only include when the exchange adds notable context.",
     "",
@@ -375,8 +364,6 @@ async function main() {
     "",
     nameToNumber.size > 0 ? `Contacts (for send_to_contact; use these exact names): ${contactNames}\n` : "",
     factsBlock || "Facts: (none)",
-    "",
-    inferencesBlock || "Inferences: (none)",
     "",
     personalityBlock ? `Personality directions for this user (follow these): ${personalityBlock}\n` : "",
     summaryBlock ? `Conversation summary (prior context):\n${summaryBlock}\n\n` : "",
@@ -427,12 +414,11 @@ async function main() {
     logErr(`Error: ${e instanceof Error ? e.message : String(e)}`);
     logErr(`Raw response (first 500 chars): ${(rawText ?? "").slice(0, 500)}`);
 
-    // If we got valid save_facts/save_inferences but missing action, save them and acknowledge.
+    // If we got valid save_facts but missing action, save them and acknowledge.
     try {
       const parsed = JSON.parse(jsonText) as Record<string, unknown>;
       const saveFacts = Array.isArray(parsed.save_facts) ? parsed.save_facts : [];
-      const saveInferences = Array.isArray(parsed.save_inferences) ? parsed.save_inferences : [];
-      if (saveFacts.length > 0 || saveInferences.length > 0) {
+      if (saveFacts.length > 0) {
         for (const f of saveFacts) {
           if (f && typeof f.key === "string" && typeof f.value === "string") {
             if ((f as FactInput).key.toLowerCase() === "personality_instruction") {
@@ -440,11 +426,6 @@ async function main() {
               continue;
             }
             upsertFact({ key: f.key, value: f.value, scope: (f as FactInput).scope ?? "user", tags: (f as FactInput).tags ?? [], path: memoryPath });
-          }
-        }
-        for (const i of saveInferences) {
-          if (i && typeof (i as InferenceInput).key === "string" && typeof (i as InferenceInput).value === "string") {
-            upsertInference({ key: (i as InferenceInput).key, value: (i as InferenceInput).value, basedOnKeys: (i as InferenceInput).basedOnKeys, path: memoryPath });
           }
         }
         process.stdout.write("Got it, I've noted that.");
@@ -476,13 +457,6 @@ async function main() {
     upsertFact({ key: f.key, value: f.value, scope: f.scope ?? "user", tags: f.tags ?? [], path: memoryPath });
   }
   if (debug && toSaveFacts.length) logBlockReq("saved facts", JSON.stringify(toSaveFacts, null, 2));
-
-  const toSaveInferences = Array.isArray(decision.save_inferences) ? decision.save_inferences : [];
-  for (const i of toSaveInferences) {
-    if (!i || typeof i.key !== "string" || typeof i.value !== "string") continue;
-    upsertInference({ key: i.key, value: i.value, basedOnKeys: i.basedOnKeys, path: memoryPath });
-  }
-  if (debug && toSaveInferences.length) logBlockReq("saved inferences", JSON.stringify(toSaveInferences, null, 2));
 
   if (decision.summary_sentence && typeof decision.summary_sentence === "string" && decision.summary_sentence.trim()) {
     appendSummarySentence(owner, decision.summary_sentence.trim());

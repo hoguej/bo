@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "default": ["weather", "brave", "todo"],
-  "byNumber": {
-    "+17404749170": ["weather", "google", "brave", "todo"],
-    "+16143480678": ["weather", "google", "brave", "todo"]
-  }
-}

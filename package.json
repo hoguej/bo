@@ -13,7 +13,8 @@
     "remember": "bun run src/cli.ts remember",
     "forget": "bun run src/cli.ts forget",
     "facts": "bun run src/cli.ts facts",
-    "skills": "bun run src/cli.ts skills"
+    "skills": "bun run src/cli.ts skills",
+    "admin": "bun run scripts/admin-server.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

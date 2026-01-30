@@ -1,5 +1,9 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  dbGetSkillsAccessByNumber,
+  dbGetSkillsAccessDefault,
+  dbGetSkillsRegistry,
+  type SkillRow,
+} from "./db";
 
 export type SkillDef = {
   id: string;
@@ -21,33 +25,41 @@ export type SkillAccessConfig = {
   byNumber: Record<string, string[]>;
 };
 
-export function loadSkillsRegistry(): SkillsRegistry {
-  const p = join(process.cwd(), "skills", "registry.json");
-  const raw = readFileSync(p, "utf-8");
-  const parsed = JSON.parse(raw) as SkillsRegistry;
-  if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.skills)) {
-    throw new Error("Invalid skills registry format");
+function skillRowToDef(r: SkillRow): SkillDef {
+  let inputSchema: unknown = {};
+  try {
+    inputSchema = JSON.parse(r.input_schema);
+  } catch {
+    /* ignore */
   }
-  return parsed;
+  return {
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    entrypoint: r.entrypoint,
+    inputSchema,
+  };
 }
 
-/** Load skills/access.json if present. Returns null if file does not exist (all skills allowed). */
+export function loadSkillsRegistry(): SkillsRegistry {
+  const rows = dbGetSkillsRegistry();
+  return {
+    version: 1,
+    skills: rows.map(skillRowToDef),
+  };
+}
+
+/** Load skills access from DB (migrated from skills/access.json). Returns null if no default row (all skills allowed). */
 export function loadSkillAccessConfig(): SkillAccessConfig | null {
-  const p = join(process.cwd(), "skills", "access.json");
-  if (!existsSync(p)) return null;
-  const raw = readFileSync(p, "utf-8");
-  const parsed = JSON.parse(raw) as SkillAccessConfig;
-  if (!parsed || parsed.version !== 1) return null;
-  if (!Array.isArray(parsed.default)) parsed.default = [];
-  if (!parsed.byNumber || typeof parsed.byNumber !== "object") parsed.byNumber = {};
-  // Normalize byNumber keys to 10-digit so "+17404749170" and "7404749170" both match lookup
-  const normalized: Record<string, string[]> = {};
-  for (const [key, skills] of Object.entries(parsed.byNumber)) {
-    const n = normalizeNumberForAccess(key);
-    if (n !== "default" && Array.isArray(skills)) normalized[n] = skills;
-  }
-  parsed.byNumber = normalized;
-  return parsed;
+  const defaultAllowed = dbGetSkillsAccessDefault();
+  const byNumber = dbGetSkillsAccessByNumber();
+  // If default is empty and no byNumber, treat as "all allowed" (return null for backward compat)
+  if (defaultAllowed.length === 0 && Object.keys(byNumber).length === 0) return null;
+  return {
+    version: 1,
+    default: defaultAllowed,
+    byNumber,
+  };
 }
 
 /** Normalize sender to 10-digit for access lookup (matches memory normalizeOwner). */
@@ -75,7 +87,8 @@ export function getAllowedSkillIdsForOwner(owner: string, allSkillIds: string[])
 }
 
 export function getSkillById(id: string): SkillDef | undefined {
-  const reg = loadSkillsRegistry();
-  return reg.skills.find((s) => s.id === id);
+  const rows = dbGetSkillsRegistry();
+  const row = rows.find((s) => s.id === id);
+  return row ? skillRowToDef(row) : undefined;
 }
 

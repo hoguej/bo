@@ -3,6 +3,7 @@ import { loadEnv } from "./env";
 
 loadEnv(process.cwd());
 
+import { runMigration } from "./db";
 import { closeSdk, getSdk } from "./sdk";
 import { runGetMessages } from "./commands/get-messages";
 import { runSendSelf } from "./commands/send-self";
@@ -31,6 +32,7 @@ Commands:
   forget <k>              Delete a saved fact
   facts                   List saved facts
   skills                  List local skills (scripts) Bo can run
+  migrate                 Migrate data from JSON files into ~/.bo/bo.db now
 
 Examples:
   bo get-messages --limit 10
@@ -75,6 +77,10 @@ Examples:
         break;
       case "skills":
         await runSkills(args);
+        break;
+      case "migrate":
+        runMigration();
+        console.log("Migration complete. Data is in ~/.bo/bo.db (or BO_DB_PATH).");
         break;
       default:
         console.error(`Unknown command: ${cmd}`);
