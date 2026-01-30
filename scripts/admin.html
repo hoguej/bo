@@ -52,6 +52,7 @@
       <textarea id="query-editor" class="query-editor" placeholder="SELECT * FROM ..."></textarea>
       <div class="query-actions">
         <button class="primary" id="run-query">Run</button>
+        <button class="primary" id="reset-query">Reset</button>
         <span id="query-msg"></span>
       </div>
     </div>
@@ -209,6 +210,14 @@
     }
 
     document.getElementById("run-query").addEventListener("click", () => runCurrentQuery());
+
+    document.getElementById("reset-query").addEventListener("click", () => {
+      if (selectedTable) {
+        const defaultQuery = "SELECT * FROM " + selectedTable;
+        document.getElementById("query-editor").value = defaultQuery;
+        runCurrentQuery();
+      }
+    });
 
     loadTables();
   </script>
