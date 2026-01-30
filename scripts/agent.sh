@@ -8,6 +8,11 @@ if [[ -z "$msg" ]]; then
   exit 1
 fi
 
+# Project root (parent of scripts/) so router/skills can find config/contacts.json etc.
+BO_PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export BO_PROJECT_ROOT
+cd "$BO_PROJECT_ROOT"
+
 # We prefer Vercel AI Gateway (GPT-4.*) for responses.
 # Auth: AI_GATEWAY_API_KEY (recommended) or VERCEL_OIDC_TOKEN.
 gateway_key="${AI_GATEWAY_API_KEY:-}"

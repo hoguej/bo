@@ -24,7 +24,7 @@ import {
   upsertFact,
   upsertInference,
 } from "../src/memory";
-import { getNameToNumber } from "../src/contacts";
+import { getNameToNumber, getNumberToName } from "../src/contacts";
 import {
   getAllowedSkillIdsForOwner,
   getSkillById,
@@ -50,6 +50,8 @@ type RouterDecision = {
   contact_name?: string;
   /** For send_to_contact: reply to the person who asked (e.g. "Okay, sent the weather to Carrie"). */
   reply_to_sender?: string;
+  /** For send_to_contact when content is LLM-generated (no skill): exact text to send to the contact (e.g. a poem, joke, message). */
+  send_body?: string;
 };
 
 /** Set at start of main() so top-level catch can log with requestId. Used only for stderr/logs; never written to stdout (user reply). */
@@ -332,7 +334,9 @@ async function main() {
     "",
     "Web Search (Brave): Use skill_id brave when the user wants to search the web (e.g. find someone's phone number, look up a fact, search for X). Set skill_input to { \"query\": <search query or user's full message> }.",
     "",
-    "Send to a contact: When the user asks to send something to a specific person (e.g. 'send Carrie the weather for tomorrow', 'send Jon the forecast', 'send Cara the weather'), use action=send_to_contact. Set contact_name to the person's first name (exactly as in the contacts list), skill_id and skill_input for the requested content (e.g. weather with day: 'tomorrow'), and reply_to_sender to a short confirmation to the person who asked (e.g. 'Okay, sent the weather to Carrie.'). Only use send_to_contact for contacts that are in the contacts list.",
+    "Todo list: Use skill_id todo for any todo request. Each person has their own list (sender's list by default). You can also act on a contact's list with for_contact (e.g. for_contact: 'Carrie'). Actions: add (text required; optional due); list (shows #1, #2, #3); mark_done (number required, e.g. 2 for #2); remove (number); edit (number and text); set_due (number and due). Examples: 'add a todo to Carrie's list to make me coffee' → action add, text 'make me coffee', for_contact 'Carrie'; 'what are Carrie's todos' or 'list Carrie's todos' → action list, for_contact 'Carrie'; 'mark #2 done' → action mark_done, number 2. When listing someone else's todos, reply in a friendly way (e.g. 'Carrie has a todo to make you coffee' when there's one).",
+    "",
+    "Send to a contact: When the user asks to send something to a specific person, use action=send_to_contact. Set contact_name to the person's first name (exactly as in the contacts list) and reply_to_sender to a short confirmation (e.g. 'Sent that poem to Carrie.'). Two cases: (1) Skill-based content (e.g. weather): set skill_id and skill_input; we run the skill and send its output to the contact. (2) Content you compose (poem, joke, custom message): set send_body to the exact text to send to the contact—we send it as-is. Do NOT use action=respond with the poem/message in response_text; use send_to_contact with send_body so we actually send it to the contact. Only use send_to_contact for contacts in the contacts list.",
     "",
     "If the user asks what you know about them: use action=respond and list both Facts and Inferences from the payload. If there are none, say you don't have any stored yet.",
     "",
@@ -496,49 +500,60 @@ async function main() {
   } else if (decision.action === "send_to_contact") {
     const contactName = (decision.contact_name ?? "").trim();
     const replyToSenderText = (decision.reply_to_sender ?? "").trim();
+    const llmSendBody = (decision.send_body ?? "").trim();
     const nameToNumber = getNameToNumber();
     const sendToNumber = contactName ? nameToNumber.get(contactName.toLowerCase()) : undefined;
     if (!contactName || !replyToSenderText || !sendToNumber) {
       logErr(`send_to_contact missing or unknown contact: contact_name=${contactName} reply_to_sender=${replyToSenderText ? "set" : "missing"} resolved=${sendToNumber ?? "none"}`);
-      process.stdout.write("I don't have that contact—check config/contacts.json?");
-      appendConversation(owner, userMessage, "I don't have that contact—check config/contacts.json?");
+      const displayName = contactName ? contactName.charAt(0).toUpperCase() + contactName.slice(1).toLowerCase() : "that person";
+      const friendlyMsg = `I don't know who ${displayName} is.`;
+      process.stdout.write(friendlyMsg);
+      appendConversation(owner, userMessage, friendlyMsg);
       return;
     }
-    const skillId = decision.skill_id;
-    if (!skillId) {
-      logErr("send_to_contact missing skill_id");
-      process.stdout.write(randomExcuse());
-      appendConversation(owner, userMessage, randomExcuse());
-      return;
+    let sendBody: string;
+    if (llmSendBody) {
+      // LLM-generated content (poem, joke, message): send as-is, no skill.
+      logErr(`next: send_to_contact ${contactName} (LLM send_body, no skill)`);
+      sendBody = llmSendBody.length > 2000 ? llmSendBody.slice(0, 1997) + "..." : llmSendBody;
+    } else {
+      const skillId = decision.skill_id;
+      if (!skillId) {
+        logErr("send_to_contact missing both send_body and skill_id");
+        process.stdout.write(randomExcuse());
+        appendConversation(owner, userMessage, randomExcuse());
+        return;
+      }
+      const skill = getSkillById(skillId);
+      if (!skill) {
+        logErr(`send_to_contact unknown skill_id: ${skillId}`);
+        process.stdout.write(randomExcuse());
+        appendConversation(owner, userMessage, randomExcuse());
+        return;
+      }
+      if (!allowedSkillIds.includes(skillId)) {
+        logErr(`Skill ${skillId} not allowed for this number`);
+        process.stdout.write("I don't have that capability for this chat—sorry!");
+        appendConversation(owner, userMessage, "I don't have that capability for this chat—sorry!");
+        return;
+      }
+      const input = (decision.skill_input ?? {}) as Record<string, unknown>;
+      logErr(`next: run skill ${skill.id} for send_to_contact ${contactName} -> ${sendToNumber}`);
+      if (debug) logBlockReq("skill input", JSON.stringify(input, null, 2));
+      const { stdout, stderr, code } = await callSkill(skill.entrypoint, input, { BO_REQUEST_ID: requestId });
+      if (stderr?.trim()) logErr(`skill stderr: ${stderr.trim().slice(0, 1000)}${stderr.length > 1000 ? "…" : ""}`);
+      if (code !== 0) {
+        logErr(`send_to_contact skill failed exitCode=${code} skill=${skill.id}`);
+        process.stdout.write(randomExcuse());
+        appendConversation(owner, userMessage, randomExcuse());
+        return;
+      }
+      sendBody = await rephraseSkillOutputForUser(openai, model, (stdout || "Done.").trim(), userMessage, requestId);
+      sendBody = sendBody.length > 2000 ? sendBody.slice(0, 1997) + "..." : sendBody;
     }
-    const skill = getSkillById(skillId);
-    if (!skill) {
-      logErr(`send_to_contact unknown skill_id: ${skillId}`);
-      process.stdout.write(randomExcuse());
-      appendConversation(owner, userMessage, randomExcuse());
-      return;
-    }
-    if (!allowedSkillIds.includes(skillId)) {
-      logErr(`Skill ${skillId} not allowed for this number`);
-      process.stdout.write("I don't have that capability for this chat—sorry!");
-      appendConversation(owner, userMessage, "I don't have that capability for this chat—sorry!");
-      return;
-    }
-    const input = (decision.skill_input ?? {}) as Record<string, unknown>;
-    logErr(`next: run skill ${skill.id} for send_to_contact ${contactName} -> ${sendToNumber}`);
-    if (debug) logBlockReq("skill input", JSON.stringify(input, null, 2));
-    const { stdout, stderr, code } = await callSkill(skill.entrypoint, input, { BO_REQUEST_ID: requestId });
-    if (stderr?.trim()) logErr(`skill stderr: ${stderr.trim().slice(0, 1000)}${stderr.length > 1000 ? "…" : ""}`);
-    if (code !== 0) {
-      logErr(`send_to_contact skill failed exitCode=${code} skill=${skill.id}`);
-      process.stdout.write(randomExcuse());
-      appendConversation(owner, userMessage, randomExcuse());
-      return;
-    }
-    const sendBody = await rephraseSkillOutputForUser(openai, model, (stdout || "Done.").trim(), userMessage, requestId);
     const payload: { sendTo: string; sendBody: string; replyToSender: string } = {
       sendTo: sendToNumber,
-      sendBody: sendBody.length > 2000 ? sendBody.slice(0, 1997) + "..." : sendBody,
+      sendBody,
       replyToSender: replyToSenderText.length > 2000 ? replyToSenderText.slice(0, 1997) + "..." : replyToSenderText,
     };
     process.stdout.write(JSON.stringify(payload) + "\n");
@@ -581,6 +596,45 @@ async function main() {
     }
     const rawSkillOutput = stdout || "Done.";
     finalReply = await rephraseSkillOutputForUser(openai, model, rawSkillOutput, userMessage, requestId);
+
+    // When someone modifies another person's todo list, notify that person.
+    if (skillId === "todo" && code === 0) {
+      const forContact = (input.for_contact as string)?.trim();
+      if (forContact) {
+        const nameToNumber = getNameToNumber();
+        const numberToName = getNumberToName();
+        const sendToNumber = nameToNumber.get(forContact.toLowerCase());
+        const senderName = numberToName.get(owner) ?? (owner === "default" ? "Someone" : owner);
+        const action = String((input.action as string) ?? "add").toLowerCase();
+        const text = (input.text as string)?.trim();
+        const num = input.number as number | undefined;
+        const due = (input.due as string)?.trim();
+        let notification: string;
+        if (action === "add" && text) {
+          notification = `${senderName} added a todo to your list: ${text}`;
+        } else if (action === "mark_done" && num != null) {
+          notification = `${senderName} marked #${num} done on your list.`;
+        } else if (action === "remove" && num != null) {
+          notification = `${senderName} removed #${num} from your list.`;
+        } else if (action === "edit" && num != null && text) {
+          notification = `${senderName} updated #${num} on your list to: ${text}`;
+        } else if (action === "set_due" && num != null && due) {
+          notification = `${senderName} set #${num} due to ${due} on your list.`;
+        } else {
+          notification = `${senderName} made a change to your todo list.`;
+        }
+        if (sendToNumber) {
+          const payload: { sendTo: string; sendBody: string; replyToSender: string } = {
+            sendTo: sendToNumber,
+            sendBody: notification.length > 2000 ? notification.slice(0, 1997) + "..." : notification,
+            replyToSender: finalReply.length > 2000 ? finalReply.slice(0, 1997) + "..." : finalReply,
+          };
+          process.stdout.write(JSON.stringify(payload) + "\n");
+          appendConversation(owner, userMessage, finalReply);
+          return;
+        }
+      }
+    }
   }
 
   // Optionally append a conversation starter to encourage the user to share.

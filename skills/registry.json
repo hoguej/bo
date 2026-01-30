@@ -67,6 +67,40 @@
         },
         "required": ["query"]
       }
+    },
+    {
+      "id": "todo",
+      "name": "Todo list",
+      "description": "Per-person todo lists. Add, list, mark done, remove, edit, set due. Can manage your own list or a contact's list (e.g. add a todo to Carrie's list). List shows #1, #2, #3; refer by number (e.g. mark #2 done).",
+      "entrypoint": "scripts/skills/todo.ts",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["add", "list", "mark_done", "remove", "edit", "set_due"],
+            "description": "add = add todo; list = show todos (#1, #2...); mark_done = mark by number; remove = remove by number; edit = change text by number; set_due = set due date by number."
+          },
+          "text": {
+            "type": "string",
+            "description": "For add: the todo text. For edit: the new text."
+          },
+          "number": {
+            "type": "number",
+            "description": "The # (1-based) from the list: for mark_done, remove, edit, set_due (e.g. 2 for #2)."
+          },
+          "for_contact": {
+            "type": "string",
+            "description": "Contact's first name (e.g. Carrie, Jon) to act on their list. Omit for the sender's own list."
+          },
+          "due": {
+            "type": "string",
+            "description": "Due date for add or set_due (e.g. 2025-01-30, tomorrow)."
+          }
+        },
+        "required": ["action"]
+      }
     }
   ]
 }

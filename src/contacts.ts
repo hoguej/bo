@@ -1,10 +1,20 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 function getContactsPath(): string {
   const override = process.env.BO_CONTACTS_PATH?.trim();
-  if (override) return override;
-  return join(process.cwd(), "config", "contacts.json");
+  if (override && existsSync(override)) return override;
+  // BO_PROJECT_ROOT is set by agent.sh so config is found regardless of process cwd.
+  const projectRoot = process.env.BO_PROJECT_ROOT?.trim();
+  if (projectRoot) {
+    const path = join(projectRoot, "config", "contacts.json");
+    if (existsSync(path)) return path;
+  }
+  // Fallbacks: path relative to this module (src/ -> project root), then cwd.
+  const fromModule = resolve(__dirname, "..", "config", "contacts.json");
+  if (existsSync(fromModule)) return fromModule;
+  const cwdPath = join(process.cwd(), "config", "contacts.json");
+  return existsSync(cwdPath) ? cwdPath : fromModule;
 }
 
 function canonicalPhone(s: string): string {

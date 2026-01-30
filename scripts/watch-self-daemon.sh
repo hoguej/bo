@@ -5,6 +5,7 @@ set -e
 BO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$BO_ROOT"
 mkdir -p logs
+export BO_PROJECT_ROOT="$BO_ROOT"
 
 if [[ -f .env.local ]]; then
   set -a
