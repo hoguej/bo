@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "default": ["weather", "brave"],
+  "byNumber": {
+    "+17404749170": ["weather", "google", "brave"],
+    "+16143480678": ["weather", "google", "brave"]
+  }
+}

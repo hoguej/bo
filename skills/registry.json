@@ -2,18 +2,71 @@
   "version": 1,
   "skills": [
     {
-      "id": "weather.tomorrow",
-      "name": "Tomorrow weather (NWS)",
-      "description": "Fetch tomorrow's forecast from weather.gov (NWS) for a ZIP code and return a concise summary string.",
-      "entrypoint": "scripts/skills/weather.tomorrow.ts",
+      "id": "weather",
+      "name": "Weather (NWS)",
+      "description": "Flexible weather: summary for a day, when it will rain, sunrise/sunset, when above freezing again, or conditions at a specific time. Supports any US location by ZIP.",
+      "entrypoint": "scripts/skills/weather.ts",
       "inputSchema": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "zip": { "type": "string", "description": "US ZIP code (5 digits). If omitted, BO_DEFAULT_ZIP is used." }
+          "location": {
+            "type": "string",
+            "description": "US location: 5-digit ZIP or text containing ZIP (e.g. '43130', 'Columbus 43130'). Omit to use BO_DEFAULT_ZIP."
+          },
+          "intent": {
+            "type": "string",
+            "enum": ["summary", "rain_timing", "sunrise_sunset", "above_freezing", "at_time"],
+            "description": "summary = day forecast; rain_timing = when will it rain; sunrise_sunset = when sun rises/sets; above_freezing = when temp > 32°F again; at_time = conditions at a specific time (use with time)."
+          },
+          "day": {
+            "type": "string",
+            "description": "For summary: 'today', 'tomorrow', or weekday ('Thursday', 'Saturday'). Multiple days: comma or ' and ' (e.g. 'tomorrow,saturday' or 'tomorrow and saturday'). For at_time: 'today' or 'tomorrow'. All times use BO_DEFAULT_TZ (default America/New_York)."
+          },
+          "time": {
+            "type": "string",
+            "description": "For intent at_time: time of day, e.g. '5pm', '17:00', '5 pm'."
+          },
+          "date": {
+            "type": "string",
+            "description": "For sunrise_sunset: date in YYYY-MM-DD. Omit for today."
+          }
         }
+      }
+    },
+    {
+      "id": "google",
+      "name": "Google (Gmail & Calendar)",
+      "description": "Search and read Gmail; send emails; list, search, create, update, delete calendar events; check free/busy. Uses gog CLI (must be configured).",
+      "entrypoint": "scripts/skills/google.ts",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Natural language request: e.g. 'search my email for invoices', 'what's on my calendar tomorrow', 'send an email to X about Y', 'create a meeting with Bob at 3pm tomorrow'."
+          }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "id": "brave",
+      "name": "Web Search (Brave)",
+      "description": "Search the web for facts, people, phone numbers, definitions, or anything. Uses Brave Search API (BRAVE_API_KEY).",
+      "entrypoint": "scripts/skills/brave.ts",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query: e.g. 'Dominic Catanzaro phone number', 'weather in Paris', 'who won the 2024 election'."
+          }
+        },
+        "required": ["query"]
       }
     }
   ]
 }
-

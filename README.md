@@ -139,6 +139,26 @@ Or run the CLI directly:
 bun run src/cli.ts get-messages --limit 5
 ```
 
+## Skill access (per-number)
+
+The router (used by the watch-self agent) can restrict which phone numbers can use which skills. Create `skills/access.json`:
+
+```json
+{
+  "version": 1,
+  "default": ["weather"],
+  "byNumber": {
+    "7404749170": ["weather", "google"],
+    "6143480678": ["weather"]
+  }
+}
+```
+
+- **default** — skill IDs allowed for any number not listed in `byNumber`.
+- **byNumber** — keys are normalized 10-digit US numbers (no + or spaces). Values are arrays of skill IDs from `skills/registry.json`.
+
+If `skills/access.json` is missing, all registered skills are allowed for everyone. Numbers are normalized the same way as memory (e.g. `+17404749170` → `7404749170`).
+
 ## AI wrapper
 
 All commands print JSON to stdout so an AI or script can parse results. Use `get-messages` for context, `send-self` for reminders or notes to yourself, `list-chats` to pick a conversation, and `react --list` to see reactions. Sending tapbacks would require Photon’s advanced-imessage-kit or a helper that uses private APIs.

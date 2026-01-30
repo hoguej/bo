@@ -1,5 +1,11 @@
 import type { IMessageSDK } from "@photon-ai/imessage-kit";
+import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { getNumberToName } from "../contacts";
+
+function newRequestId(): string {
+  return randomBytes(4).toString("hex");
+}
 
 const SELF_HANDLE = process.env.BO_MY_PHONE ?? process.env.BO_MY_EMAIL;
 
@@ -8,6 +14,11 @@ const AGENT_SCRIPT = process.env.BO_AGENT_SCRIPT?.trim();
 
 /** Message guids we sent (our replies). Never react to these. */
 const sentMessageGuids = new Set<string>();
+
+/** Incoming message guids we already processed (avoid double reply when watcher fires twice). */
+const processedMessageGuids = new Set<string>();
+const processedMessageOrder: string[] = [];
+const MAX_PROCESSED = 100;
 
 /** Exact reply texts we just sent (belt-and-suspenders: skip if watcher reports our message without isFromMe). */
 const recentSentReplyTexts = new Set<string>();
@@ -23,6 +34,22 @@ function canonicalPhone(s: string): string {
   const digits = normalizePhone(s);
   if (digits.length === 11 && digits.startsWith("1")) return digits.slice(1);
   return digits;
+}
+
+/** Format for iMessage delivery: 10-digit US number → +1XXXXXXXXXX (E.164). */
+function toE164(recipient: string): string {
+  const digits = normalizePhone(recipient);
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return recipient.startsWith("+") ? recipient : `+${recipient}`;
+}
+
+const NUMBER_TO_NAME = getNumberToName();
+
+function senderDisplay(sender: string): string {
+  const canonical = canonicalPhone(sender);
+  const name = NUMBER_TO_NAME.get(canonical);
+  return name ? `${name} (${canonical})` : sender;
 }
 
 /** Optional: when any of these numbers send a message, we pass it to the agent and reply (any chat). Comma-separated. */
@@ -154,7 +181,7 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
         [
           "---",
           `To: ${msg.chatId}`,
-          `From: ${msg.sender}`,
+          `From: ${senderDisplay(msg.sender ?? "")}`,
           `Message: ${text || "(empty)"}`,
           `Pass to agent: ${passToAgent ? "Yes" : "No"}`,
           `Why: ${why}`,
@@ -168,6 +195,14 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
 
       if (sentMessageGuids.has(guid)) return;
       if (text && recentSentReplyTexts.has(text)) return;
+      if (processedMessageGuids.has(guid)) return; // already handled this message (watcher can fire twice)
+
+      processedMessageGuids.add(guid);
+      processedMessageOrder.push(guid);
+      if (processedMessageOrder.length > MAX_PROCESSED) {
+        const old = processedMessageOrder.shift()!;
+        processedMessageGuids.delete(old);
+      }
 
       let messageToAgent: string;
       let replyTo: string;
@@ -186,9 +221,13 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
 
       if (!messageToAgent) return;
 
+      // One requestId per incoming message that we process. Passed through env for logging only; never sent to user.
+      const requestId = newRequestId();
+
       // Provide request context to the agent/router via env.
       // Enable router debug so prompts/responses are printed to stderr when running the loop.
       const ctxEnv: Record<string, string> = {
+        BO_REQUEST_ID: requestId,
         BO_REQUEST_FROM: msg.sender ?? "",
         BO_REQUEST_TO: msg.chatId ?? "",
         BO_REQUEST_IS_SELF_CHAT: isSelf ? "true" : "false",
@@ -196,27 +235,79 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
         BO_ROUTER_DEBUG: "1",
       };
 
-      const { stdout, stderr, code } = await runAgent(messageToAgent, ctxEnv);
-      let reply = code === 0 ? (stdout || "Done.") : (stderr || `Exit ${code}`);
-      if (reply.length > 2000) reply = reply.slice(0, 1997) + "...";
-      reply = sanitizeReply(reply);
+      console.error(`[bo watch-self] [req:${requestId}] invoking agent (${messageToAgent.length} chars): "${messageToAgent.slice(0, 80)}${messageToAgent.length > 80 ? "…" : ""}"`);
 
-      // Record reply text BEFORE sending so the watcher never processes our own message (race-safe).
-      recentSentReplyTexts.add(reply);
-      recentSentReplyOrder.push(reply);
-      if (recentSentReplyOrder.length > MAX_RECENT_SENT) {
-        const old = recentSentReplyOrder.shift()!;
-        recentSentReplyTexts.delete(old);
+      const { stdout, stderr, code } = await runAgent(messageToAgent, ctxEnv);
+
+      console.error(`[bo watch-self] [req:${requestId}] agent finished exitCode=${code} stdoutLen=${(stdout ?? "").length} stderrLen=${(stderr ?? "").length}`);
+      if (code !== 0 && stderr?.trim()) {
+        console.error(`[bo watch-self] [req:${requestId}] agent stderr: ${stderr.trim().slice(0, 500)}${stderr.length > 500 ? "…" : ""}`);
       }
 
-      const result = await sdk.send(replyTo, reply);
-      if (result.message?.guid) {
-        sentMessageGuids.add(result.message.guid);
+      // Optional: agent may output first line as JSON { sendTo, sendBody, replyToSender } to send content to another contact and reply to sender.
+      const stdoutStr = (stdout ?? "").trim();
+      const firstLine = stdoutStr.split("\n")[0] ?? "";
+      let sendToContact: string | null = null;
+      let sendBody: string | null = null;
+      let replyToSender: string | null = null;
+      if (code === 0 && firstLine) {
+        try {
+          const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+          if (
+            typeof parsed.sendTo === "string" &&
+            typeof parsed.sendBody === "string" &&
+            typeof parsed.replyToSender === "string"
+          ) {
+            sendToContact = parsed.sendTo.trim();
+            sendBody = parsed.sendBody.trim();
+            replyToSender = parsed.replyToSender.trim();
+          }
+        } catch {
+          // not JSON or wrong shape — treat whole stdout as reply
+        }
+      }
+
+      if (sendToContact && sendBody !== null && replyToSender !== null) {
+        // Send the content to the other contact, then reply to the original sender.
+        const bodyToSend = sanitizeReply(sendBody.length > 2000 ? sendBody.slice(0, 1997) + "..." : sendBody);
+        const reply = sanitizeReply(replyToSender.length > 2000 ? replyToSender.slice(0, 1997) + "..." : replyToSender);
+        recentSentReplyTexts.add(bodyToSend);
+        recentSentReplyOrder.push(bodyToSend);
+        recentSentReplyTexts.add(reply);
+        recentSentReplyOrder.push(reply);
+        while (recentSentReplyOrder.length > MAX_RECENT_SENT) {
+          const old = recentSentReplyOrder.shift()!;
+          recentSentReplyTexts.delete(old);
+        }
+        const resultToContact = await sdk.send(toE164(sendToContact), bodyToSend);
+        if (resultToContact.message?.guid) sentMessageGuids.add(resultToContact.message.guid);
+        const resultToSender = await sdk.send(replyTo, reply);
+        if (resultToSender.message?.guid) sentMessageGuids.add(resultToSender.message.guid);
+        if (!resultToSender.message?.guid) {
+          const recent = await sdk.getMessages({ chatId: replyTo, limit: 1 });
+          const latest = recent.messages[0];
+          if (latest?.isFromMe && latest.guid) sentMessageGuids.add(latest.guid);
+        }
       } else {
-        const recent = await sdk.getMessages({ chatId: replyTo, limit: 1 });
-        const latest = recent.messages[0];
-        if (latest?.isFromMe && latest.guid) {
-          sentMessageGuids.add(latest.guid);
+        // Normal single reply to sender.
+        let reply = code === 0 ? (stdoutStr || "Done.") : (stderr || `Exit ${code}`);
+        if (reply.length > 2000) reply = reply.slice(0, 1997) + "...";
+        reply = sanitizeReply(reply);
+        recentSentReplyTexts.add(reply);
+        recentSentReplyOrder.push(reply);
+        if (recentSentReplyOrder.length > MAX_RECENT_SENT) {
+          const old = recentSentReplyOrder.shift()!;
+          recentSentReplyTexts.delete(old);
+        }
+        const result = await sdk.send(replyTo, reply);
+        if (result.message?.guid) {
+          sentMessageGuids.add(result.message.guid);
+        } else {
+          const recent = await sdk.getMessages({ chatId: replyTo, limit: 1 });
+          const latest = recent.messages[0];
+          if (latest?.isFromMe && latest.guid) {
+            sentMessageGuids.add(latest.guid);
+          }
         }
       }
     },

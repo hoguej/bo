@@ -37,6 +37,7 @@ build/
 .env
 .env.*
 !.env.local.example
+
 *.pem
 *.key
 
