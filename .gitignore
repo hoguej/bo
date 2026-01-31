@@ -22,6 +22,31 @@ node_modules/
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Next.js
+.next/
+out/
+build/
+dist/
+
+# Environment files
+.env.local
+.env.production
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Railway
+.railway/
 .Python
 venv/
 .venv/

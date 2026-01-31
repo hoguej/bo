@@ -1,7 +1,8 @@
 /**
- * Todo skill: per-person todo lists. Add, list, mark done, remove, edit, set due.
- * Owner = sender (my list) or contact name (Carrie's list). List shows task id, verbatim text, creator, due.
+ * Todo skill: per-person todo lists. Add, list, mark done, remove, edit.
+ * Owner = sender (my list) or contact name (Carrie's list). List shows task id, verbatim text, creator.
  * Data stored in ~/.bo/bo.db (SQLite). Creator is tracked by user id; assignee (list owner) can differ.
+ * For specific times use the reminder skill.
  */
 
 import {
@@ -10,7 +11,6 @@ import {
   dbGetTodos,
   dbGetUserById,
   dbUpdateTodoDone,
-  dbUpdateTodoDue,
   dbUpdateTodoText,
 } from "../../src/db";
 import { getNumberToName, resolveContactToNumber } from "../../src/contacts";
@@ -20,20 +20,19 @@ type Todo = {
   id: number;
   text: string;
   done: boolean;
-  due?: string | null;
   createdAt: string;
   creatorDisplayName: string;
 };
 
-type TodoItemInput = { text: string; due?: string };
+type TodoItemInput = { text: string };
 
 type Input = {
-  action: "add" | "add_many" | "list" | "mark_done" | "remove" | "edit" | "set_due";
+  action: "add" | "add_many" | "list" | "mark_done" | "remove" | "edit";
   text?: string;
   items?: TodoItemInput[];
   number?: number;
   for_contact?: string;
-  due?: string;
+  for_contacts?: string[];
   show_done?: boolean;
   match_phrase?: string;
 };
@@ -55,7 +54,6 @@ function loadTodos(owner: string, opts?: { includeDone?: boolean }): Todo[] {
       id: r.id,
       text: r.text,
       done: r.done !== 0,
-      due: r.due ?? undefined,
       createdAt: r.createdAt,
       creatorDisplayName,
     };
@@ -95,16 +93,13 @@ function readJsonStdin(): Promise<unknown> {
   });
 }
 
-/** List format: id (ascending), verbatim text, creator, due date if any. Read back text is always verbatim from storage. */
+/** List format: id (ascending), verbatim text, creator. Read back text is always verbatim from storage. */
 function formatTodoList(todos: Todo[], displayName: string): string {
   if (todos.length === 0) {
     const verb = displayName.toLowerCase() === "you" ? "have" : "has";
     return `${displayName} ${verb} no open todos.`;
   }
-  const lines = todos.map((t) => {
-    const due = t.due ? ` | due ${t.due}` : "";
-    return `${t.id}. ${t.text} | ${t.creatorDisplayName}${due}`;
-  });
+  const lines = todos.map((t) => `${t.id}. ${t.text} | ${t.creatorDisplayName}`);
   return `${displayName}'s todos:\n` + lines.join("\n");
 }
 
@@ -138,23 +133,51 @@ function resolveTodoNumber(input: Input, todos: Todo[], isOwnList: boolean): num
   return best?.id ?? null;
 }
 
-function writeOutput(response: string, hints?: { todo_ids?: number[] }) {
+function writeOutput(response: string, hints?: { todo_ids?: number[]; suppress_reply?: boolean }) {
   const out: Record<string, unknown> = { response };
-  if (hints && (hints.todo_ids?.length ?? 0) > 0) out.hints = hints;
+  if (hints && ((hints.todo_ids?.length ?? 0) > 0 || hints.suppress_reply === true)) out.hints = hints;
   process.stdout.write(JSON.stringify(out));
 }
 
 async function main() {
   const input = (await readJsonStdin()) as Input;
   const action = input?.action?.toLowerCase();
-  if (!action || !["add", "add_many", "list", "mark_done", "remove", "edit", "set_due"].includes(action)) {
-    process.stderr.write("todo skill: action must be add, add_many, list, mark_done, remove, edit, or set_due\n");
+  if (!action || !["add", "add_many", "list", "mark_done", "remove", "edit"].includes(action)) {
+    process.stderr.write("todo skill: action must be add, add_many, list, mark_done, remove, or edit\n");
     process.exit(1);
   }
 
-  const { owner, displayName } = resolveOwner(input);
   const fromRaw = process.env.BO_REQUEST_FROM ?? "";
   const requestorOwner = normalizeOwner(fromRaw);
+
+  // Multi-recipient add: for_contacts array
+  if (action === "add" && input.for_contacts && Array.isArray(input.for_contacts) && input.for_contacts.length > 0) {
+    const text = (input.text ?? "").trim();
+    if (!text) {
+      process.stderr.write("todo skill: add requires text\n");
+      process.exit(1);
+    }
+    const creatorOwner = fromRaw ? requestorOwner : undefined;
+    const recipients: Array<{ name: string; id?: number }> = [];
+    for (const contactName of input.for_contacts) {
+      const num = resolveContactToNumber(contactName.trim());
+      if (num) {
+        const id = dbAddTodo(num, text, creatorOwner);
+        const displayName = getNumberToName().get(num) ?? contactName.trim();
+        recipients.push({ name: displayName, id });
+      }
+    }
+    if (recipients.length === 0) {
+      writeOutput(`Couldn't find any of those contacts.`);
+      return;
+    }
+    const names = recipients.map(r => r.name).join(" and ");
+    const ids = recipients.map(r => r.id).filter((id): id is number => id != null);
+    writeOutput(`Added to ${names}'s lists: "${text}".`, ids.length ? { todo_ids: ids, for_contacts: input.for_contacts } : undefined);
+    return;
+  }
+
+  const { owner, displayName } = resolveOwner(input);
   const isOwnList = !input.for_contact?.trim() || owner === requestorOwner;
 
   switch (action) {
@@ -165,7 +188,7 @@ async function main() {
         process.exit(1);
       }
       const creatorOwner = fromRaw ? requestorOwner : undefined;
-      const id = dbAddTodo(owner, text, input.due?.trim() || null, creatorOwner);
+      const id = dbAddTodo(owner, text, creatorOwner);
       const forWho = input.for_contact ? ` to ${displayName}'s list` : "";
       writeOutput(`Added "${text}"${forWho}.`, id != null ? { todo_ids: [id] } : undefined);
       return;
@@ -175,17 +198,17 @@ async function main() {
       const rawItems = input.items;
       const items = Array.isArray(rawItems)
         ? rawItems
-            .map((item) => (typeof item === "object" && item != null && typeof (item as TodoItemInput).text === "string" ? { text: (item as TodoItemInput).text.trim(), due: typeof (item as TodoItemInput).due === "string" ? (item as TodoItemInput).due?.trim() : undefined } : null))
-            .filter((item): item is { text: string; due?: string } => item != null && item.text.length > 0)
+            .map((item) => (typeof item === "object" && item != null && typeof (item as TodoItemInput).text === "string" ? { text: (item as TodoItemInput).text.trim() } : null))
+            .filter((item): item is { text: string } => item != null && item.text.length > 0)
         : [];
       if (items.length === 0) {
-        process.stderr.write("todo skill: add_many requires items (array of { text, due? })\n");
+        process.stderr.write("todo skill: add_many requires items (array of { text })\n");
         process.exit(1);
       }
       const creatorOwner = fromRaw ? requestorOwner : undefined;
       const ids: number[] = [];
       for (const item of items) {
-        const id = dbAddTodo(owner, item.text, item.due ?? null, creatorOwner);
+        const id = dbAddTodo(owner, item.text, creatorOwner);
         if (id != null) ids.push(id);
       }
       const forWho = input.for_contact ? ` to ${displayName}'s list` : "";
@@ -205,7 +228,9 @@ async function main() {
       const todos = loadTodos(owner, { includeDone });
       const out = formatTodoList(todos, displayName);
       const todoIds = todos.map((t) => t.id);
-      writeOutput(out, todoIds.length ? { todo_ids: todoIds } : undefined);
+      const isScheduledDailyTodos = process.env.BO_SCHEDULED_DAILY_TODOS === "1";
+      const hints = todoIds.length ? { todo_ids: todoIds } : isScheduledDailyTodos ? { suppress_reply: true } : undefined;
+      writeOutput(out, hints);
       return;
     }
 
@@ -263,28 +288,6 @@ async function main() {
       dbUpdateTodoText(owner, todo.id, newText);
       const forWho = input.for_contact ? ` on ${displayName}'s list` : "";
       writeOutput(`Updated #${todo.id} to "${newText}"${forWho}.`, { todo_ids: [todo.id] });
-      return;
-    }
-
-    case "set_due": {
-      const due = (input.due ?? "").trim();
-      if (!due) {
-        process.stderr.write("todo skill: set_due requires due (e.g. 2025-01-30 or tomorrow)\n");
-        process.exit(1);
-      }
-      const todos = loadTodos(owner, { includeDone: true });
-      const id = resolveTodoNumber(input, todos, isOwnList);
-      if (id == null) {
-        const msg = isOwnList
-          ? `Couldn't match a todo. Specify the task number or a matching phrase.`
-          : `To set due on ${displayName}'s list, specify the task number.`;
-        writeOutput(msg);
-        return;
-      }
-      const todo = todos.find((t) => t.id === id)!;
-      dbUpdateTodoDue(owner, todo.id, due);
-      const forWho = input.for_contact ? ` on ${displayName}'s list` : "";
-      writeOutput(`Set #${todo.id} due ${due}${forWho}.`, { todo_ids: [todo.id] });
       return;
     }
   }

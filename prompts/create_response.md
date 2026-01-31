@@ -22,7 +22,7 @@ When **skill_output** is a todo list (e.g. "Your todos:" or "X's todos:" followe
 
 - Keep **one line per task**: task id, then the **verbatim** task text (exactly as stored). Do **not** rephrase, merge, or narrativize the items (e.g. no "cut the floor and check the trim (twice!)").
 - You may add a short intro and/or outro in Bo's voice (e.g. "Here's your lineup for tomorrow:" before the list, "Let me know when you want to check something off." after).
-- Format each list line as: **id. verbatim text** only (e.g. "7. Cut out the floor and look at trim"). **Do not include** creator name or due date on the line—omit any "| Jon Hogue | due tomorrow" or similar. The skill_output may contain that; strip it and show only id and task text. The ids matter so the user can say "mark #7 done" later.
+- Format each list line as: **id. verbatim text** only (e.g. "7. Cut out the floor and look at trim"). **Do not include** creator name on the line—omit any "| Jon Hogue" or similar. The skill_output may contain that; strip it and show only id and task text. The ids matter so the user can say "mark #7 done" later.
 
 For other skills (weather, etc.): rephrase in a natural, Bo way. If the skill returned hints (e.g. todo_ids), you may reference them in the reply.
 

@@ -20,6 +20,10 @@ import {
   dbAdvanceRecurringReminder,
   dbGetOwnerByUserId,
   dbGetTodos,
+  dbGetAllUsers,
+  dbGetUserById,
+  dbUpsertGroupChat,
+  dbGetGroupChatByName,
 } from "../db";
 import { canonicalPhone, toE164 } from "../phone";
 
@@ -138,8 +142,8 @@ function sanitizeReply(reply: string): string {
 /** Stored so handleIncomingMessage can send to contacts via Telegram when sendToTelegramId is set. */
 let telegramBotInstance: Bot | null = null;
 
-/** Create and configure Telegram bot; call bot.start() to run long polling (same process as iMessage watcher). Pass sdk so Telegram handler can send to contacts via iMessage when they have no telegram_id. */
-function createTelegramBot(sdk: IMessageSDK): Bot | null {
+/** Create and configure Telegram bot; call bot.start() to run long polling. */
+function createTelegramBot(): Bot | null {
   const token = process.env.BO_TELEGRAM_BOT_TOKEN?.trim();
   if (!token) return null;
   const bot = new Bot(token);
@@ -155,11 +159,68 @@ function createTelegramBot(sdk: IMessageSDK): Bot | null {
   bot.command("id", replyWithTelegramId);
 
   bot.on("message:text", async (ctx) => {
-    const text = (ctx.message?.text ?? "").trim();
+    let text = (ctx.message?.text ?? "").trim();
     const from = ctx.from;
     if (!from?.id) return;
     const telegramId = String(from.id);
     const owner = "telegram:" + telegramId;
+    
+    // Check if this is a group chat
+    const chatType = ctx.chat?.type;
+    const isGroup = chatType === "group" || chatType === "supergroup";
+    
+    // In groups, store/update group chat info
+    if (isGroup && ctx.chat) {
+      const chatId = String(ctx.chat.id);
+      const chatTitle = ctx.chat.title || `Group ${chatId}`;
+      dbUpsertGroupChat(chatId, chatTitle, chatType);
+    }
+    
+    // In groups, only respond if message starts with "Bo " (case-insensitive)
+    if (isGroup) {
+      const boPrefix = /^bo\s+/i;
+      if (!boPrefix.test(text)) return; // Not for us, ignore
+      text = text.replace(boPrefix, "").trim(); // Remove "Bo " prefix
+      
+      // Replace "everyone", "everybody", "all" with actual group member names
+      if (/\b(everyone|everybody|all)\b/i.test(text)) {
+        try {
+          const chatId = ctx.chat.id;
+          const memberNames: string[] = [];
+          
+          // Get all users from database who have telegram_ids
+          const allUsers = dbGetAllUsers();
+          const seenInGroup = new Set<number>();
+          
+          // Try to verify which users are actually in this group
+          for (const user of allUsers) {
+            if (!user.telegram_id) continue;
+            const memberId = user.telegram_id.replace(/^telegram:/, "");
+            if (memberId === String(bot.botInfo.id)) continue; // Skip the bot itself
+            
+            // Try to get member status (will fail if not in group)
+            try {
+              await bot.api.getChatMember(chatId, Number(memberId));
+              // If we got here, they're in the group
+              seenInGroup.add(user.id);
+              if (user.first_name) {
+                memberNames.push(user.first_name);
+              }
+            } catch {
+              // Not in group or error, skip
+            }
+          }
+          
+          if (memberNames.length > 0) {
+            const namesList = memberNames.join(", ");
+            text = text.replace(/\b(everyone|everybody|all)\b/gi, namesList);
+            console.error(`[bo telegram] Expanded "everyone" to: ${namesList}`);
+          }
+        } catch (err) {
+          console.error(`[bo telegram] Failed to expand "everyone": ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
 
     if (/^\/(start|myid|id)(\s|$)/i.test(text)) return; // Handled by command handlers; skip agent
 
@@ -187,40 +248,100 @@ function createTelegramBot(sdk: IMessageSDK): Bot | null {
       BO_REQUEST_IS_FROM_ME: "false",
       BO_ROUTER_DEBUG: "1",
     };
-    console.error(`[bo telegram] [req:${requestId}] invoking agent (${text.length} chars) from telegram_id=${telegramId}`);
+    const chatInfo = isGroup ? ` (group: ${ctx.chat.title || ctx.chat.id})` : "";
+    console.error(`[bo telegram] [req:${requestId}] invoking agent (${text.length} chars) from telegram_id=${telegramId}${chatInfo}`);
     const { stdout, stderr, code } = await runAgent(text, ctxEnv);
     if (code !== 0 && stderr?.trim()) {
       console.error(`[bo telegram] [req:${requestId}] agent stderr: ${stderr.trim().slice(0, 300)}`);
     }
     const stdoutStr = (stdout ?? "").trim();
-    let reply = code !== 0 ? (stderr || `Exit ${code}`) : stdoutStr;
-    if (stdoutStr && code === 0) {
-      const firstLine = stdoutStr.split("\n")[0] ?? "";
+    const lines = stdoutStr.split("\n").filter(l => l.trim());
+    
+    // Parse all lines for JSON payloads (multi-recipient support + group messages)
+    type MessagePayload = { 
+      sendTo?: string; 
+      sendBody: string; 
+      replyToSender: string; 
+      sendToTelegramId?: string;
+      sendToGroup?: string; // group chat_id
+    };
+    const messagesToSend: MessagePayload[] = [];
+    let finalReplyText: string | null = null;
+    const plainTextLines: string[] = [];
+    
+    for (const line of lines) {
       try {
-        const parsed = JSON.parse(firstLine) as Record<string, unknown>;
-        const sendTo = typeof parsed.sendTo === "string" ? parsed.sendTo.trim() : "";
-        const sendBody = typeof parsed.sendBody === "string" ? parsed.sendBody.trim() : "";
-        const replyToSender = typeof parsed.replyToSender === "string" ? parsed.replyToSender.trim() : "";
-        const sendToTelegramId = typeof parsed.sendToTelegramId === "string" ? parsed.sendToTelegramId.trim() : "";
-        if (sendTo && sendBody && replyToSender) {
-          const bodyToSend = sanitizeReply(sendBody.length > 4000 ? sendBody.slice(0, 3997) + "..." : sendBody);
-          const replyText = sanitizeReply(replyToSender.length > 4000 ? replyToSender.slice(0, 3997) + "..." : replyToSender);
-          if (sendToTelegramId) {
-            await bot.api.sendMessage(sendToTelegramId, bodyToSend);
-          } else {
-            await sdk.send(toE164(sendTo), bodyToSend);
-          }
-          await ctx.reply(replyText);
-          lastReplyAt = Date.now();
-          if (userId != null) dbUpdateLastConvoEndUtc(userId);
-          return;
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        // Group message
+        if (
+          typeof parsed.sendToGroup === "string" &&
+          typeof parsed.sendBody === "string"
+        ) {
+          const msg: MessagePayload = {
+            sendToGroup: parsed.sendToGroup.trim(),
+            sendBody: parsed.sendBody.trim(),
+            replyToSender: typeof parsed.replyToSender === "string" ? parsed.replyToSender.trim() : "",
+          };
+          messagesToSend.push(msg);
         }
-        if (typeof parsed.response_text === "string") reply = parsed.response_text.trim();
-        else if (typeof parsed.replyToSender === "string") reply = parsed.replyToSender.trim();
+        // Contact message
+        else if (
+          typeof parsed.sendTo === "string" &&
+          typeof parsed.sendBody === "string"
+        ) {
+          const msg: MessagePayload = {
+            sendTo: parsed.sendTo.trim(),
+            sendBody: parsed.sendBody.trim(),
+            replyToSender: typeof parsed.replyToSender === "string" ? parsed.replyToSender.trim() : "",
+          };
+          if (typeof parsed.sendToTelegramId === "string" && parsed.sendToTelegramId.trim()) {
+            msg.sendToTelegramId = parsed.sendToTelegramId.trim();
+          }
+          messagesToSend.push(msg);
+        } else if (typeof parsed.response_text === "string") {
+          finalReplyText = parsed.response_text.trim();
+        }
       } catch {
-        /* use full stdout */
+        // Not JSON, treat as plain text reply
+        if (code === 0) plainTextLines.push(line);
       }
     }
+    
+    // If we collected plain text lines and no finalReplyText from JSON, use them
+    if (!finalReplyText && plainTextLines.length > 0) {
+      finalReplyText = plainTextLines.join("\n");
+    }
+    
+    // If we have messages to send, send them all and use the last replyToSender or finalReplyText as ack
+    if (messagesToSend.length > 0) {
+      for (const msg of messagesToSend) {
+        const bodyToSend = sanitizeReply(msg.sendBody.length > 4000 ? msg.sendBody.slice(0, 3997) + "..." : msg.sendBody);
+        if (!bodyToSend.trim()) continue; // Skip empty messages
+        
+        // Send to group chat
+        if (msg.sendToGroup) {
+          await bot.api.sendMessage(msg.sendToGroup, bodyToSend);
+        }
+        // Send to individual via Telegram
+        else if (msg.sendToTelegramId) {
+          await bot.api.sendMessage(msg.sendToTelegramId, bodyToSend);
+        } else {
+          console.error(`[bo telegram] Recipient ${msg.sendTo} has no telegram_id, cannot send (Telegram-only mode)`);
+        }
+      }
+      
+      const lastReplyToSender = messagesToSend[messagesToSend.length - 1]?.replyToSender || finalReplyText || "Done.";
+      const reply = sanitizeReply(lastReplyToSender.length > 4000 ? lastReplyToSender.slice(0, 3997) + "..." : lastReplyToSender);
+      if (reply.trim()) {
+        await ctx.reply(reply);
+      }
+      lastReplyAt = Date.now();
+      if (userId != null) dbUpdateLastConvoEndUtc(userId);
+      return;
+    }
+    
+    // Fallback: plain text reply
+    let reply = code !== 0 ? (stderr || `Exit ${code}`) : (finalReplyText || stdoutStr);
     if (reply.length > 4000) reply = reply.slice(0, 3997) + "...";
     await ctx.reply(reply);
     lastReplyAt = Date.now();
@@ -399,7 +520,86 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
   }
 
   const stdoutStr = (stdout ?? "").trim();
-  const firstLine = stdoutStr.split("\n")[0] ?? "";
+  const lines = stdoutStr.split("\n").filter(l => l.trim());
+  
+  // Parse all lines for JSON payloads (multi-recipient support)
+  type MessagePayload = { sendTo: string; sendBody: string; replyToSender: string; sendToTelegramId?: string };
+  const messagesToSend: MessagePayload[] = [];
+  let finalReplyText: string | null = null;
+  
+  for (const line of lines) {
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (
+        typeof parsed.sendTo === "string" &&
+        typeof parsed.sendBody === "string"
+      ) {
+        const msg: MessagePayload = {
+          sendTo: parsed.sendTo.trim(),
+          sendBody: parsed.sendBody.trim(),
+          replyToSender: typeof parsed.replyToSender === "string" ? parsed.replyToSender.trim() : "",
+        };
+        if (typeof parsed.sendToTelegramId === "string" && parsed.sendToTelegramId.trim()) {
+          msg.sendToTelegramId = parsed.sendToTelegramId.trim();
+        }
+        messagesToSend.push(msg);
+      }
+    } catch {
+      // Not JSON, treat as plain text reply
+      if (code === 0 && !finalReplyText) finalReplyText = line;
+    }
+  }
+
+  // If we have messages to send, send them all and use the last replyToSender or finalReplyText as ack
+  if (messagesToSend.length > 0) {
+    const lastReplyToSender = messagesToSend[messagesToSend.length - 1]?.replyToSender || finalReplyText || "Done.";
+    const reply = sanitizeReply(lastReplyToSender.length > 2000 ? lastReplyToSender.slice(0, 1997) + "..." : lastReplyToSender);
+    
+    recentSentReplyTexts.add(reply);
+    recentSentReplyOrder.push(reply);
+    if (recentSentReplyOrder.length > MAX_RECENT_SENT) {
+      const old = recentSentReplyOrder.shift()!;
+      recentSentReplyTexts.delete(old);
+    }
+    
+    // Send to all recipients (Telegram only)
+    for (const msg of messagesToSend) {
+      const bodyToSend = sanitizeReply(msg.sendBody.length > 2000 ? msg.sendBody.slice(0, 1997) + "..." : msg.sendBody);
+      if (!bodyToSend.trim()) continue; // Skip empty messages
+      
+      recentSentReplyTexts.add(bodyToSend);
+      recentSentReplyOrder.push(bodyToSend);
+      while (recentSentReplyOrder.length > MAX_RECENT_SENT) {
+        const old = recentSentReplyOrder.shift()!;
+        recentSentReplyTexts.delete(old);
+      }
+      
+      // Telegram only - no iMessage sends to contacts
+      if (msg.sendToTelegramId && telegramBotInstance) {
+        await telegramBotInstance.api.sendMessage(msg.sendToTelegramId, bodyToSend);
+      } else {
+        console.error(`[bo watch-self] Recipient ${msg.sendTo} has no telegram_id, cannot send (Telegram-only mode)`);
+      }
+    }
+    
+    // Send acknowledgement to original sender
+    if (reply.trim()) {
+      const resultToSender = await sdk.send(replyTo, reply);
+      if (resultToSender.message?.guid) sentMessageGuids.add(resultToSender.message.guid);
+      if (!resultToSender.message?.guid) {
+        const recent = await sdk.getMessages({ chatId: replyTo, limit: 1 });
+        const latest = recent.messages[0];
+        if (latest?.isFromMe && latest.guid) sentMessageGuids.add(latest.guid);
+      }
+    }
+    dbMarkMessageReplied(guid);
+    if (recipientUserId != null) dbUpdateLastConvoEndUtc(recipientUserId);
+    lastReplyAt = Date.now();
+    return;
+  }
+
+  // Fallback: old single-recipient logic
+  const firstLine = lines[0] ?? "";
   let sendToContact: string | null = null;
   let sendBody: string | null = null;
   let replyToSender: string | null = null;
@@ -459,11 +659,11 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         const old = recentSentReplyOrder.shift()!;
         recentSentReplyTexts.delete(old);
       }
+      // Telegram only - no iMessage sends to contacts
       if (sendToTelegramId && telegramBotInstance) {
         await telegramBotInstance.api.sendMessage(sendToTelegramId, bodyToSend);
       } else {
-        const resultToContact = await sdk.send(toE164(sendToContact), bodyToSend);
-        if (resultToContact.message?.guid) sentMessageGuids.add(resultToContact.message.guid);
+        console.error(`[bo watch-self] Recipient ${sendToContact} has no telegram_id, cannot send (Telegram-only mode)`);
       }
       const resultToSender = await sdk.send(replyTo, reply);
       if (resultToSender.message?.guid) sentMessageGuids.add(resultToSender.message.guid);
@@ -524,7 +724,7 @@ const DAILY_STARTER_MINUTE = 30;
 const NUDGE_WINDOW_START = { hour: 9, minute: 30 };
 const NUDGE_WINDOW_END = { hour: 20, minute: 0 };
 
-async function runSchedulerTick(sdk: IMessageSDK, bot: Bot | null): Promise<void> {
+async function runSchedulerTick(bot: Bot | null): Promise<void> {
   const primaryUserIdStr = dbGetConfig("primary_user_id")?.trim();
   if (!primaryUserIdStr) return;
   const primaryUserId = parseInt(primaryUserIdStr, 10);
@@ -553,18 +753,6 @@ async function runSchedulerTick(sdk: IMessageSDK, bot: Bot | null): Promise<void
   const isInWindow = localMinutes >= windowStartMinutes && localMinutes < windowEndMinutes;
   const isAfterDailyStarter = localMinutes >= DAILY_STARTER_HOUR * 60 + DAILY_STARTER_MINUTE;
 
-  if (isAfterDailyStarter && (!state?.last_daily_starter_date || state.last_daily_starter_date < todayLocal)) {
-    const syntheticMessage = `[scheduled: daily_starter] Start a friendly daily check-in.`;
-    console.error(`[bo watch-self] scheduler: firing daily_starter for user ${primaryUserId}`);
-    const { stdout, stderr, code } = await runAgent(syntheticMessage, ctxEnv);
-    if (code === 0 && stdout?.trim()) {
-      await sendSchedulerReply(stdout.trim(), owner, primaryUserId, sdk, bot);
-      dbUpsertScheduleState(primaryUserId, { last_daily_starter_date: todayLocal });
-    } else if (stderr?.trim()) {
-      console.error(`[bo watch-self] scheduler daily_starter stderr: ${stderr.trim().slice(0, 300)}`);
-    }
-  }
-
   if (isInWindow && state?.last_convo_end_utc) {
     const lastConvoMs = new Date(state.last_convo_end_utc).getTime();
     const fourHoursMs = 4 * 60 * 60 * 1000;
@@ -574,7 +762,7 @@ async function runSchedulerTick(sdk: IMessageSDK, bot: Bot | null): Promise<void
       console.error(`[bo watch-self] scheduler: firing 4h_nudge for user ${primaryUserId}`);
       const { stdout, stderr, code } = await runAgent(syntheticMessage, ctxEnv);
       if (code === 0 && stdout?.trim()) {
-        await sendSchedulerReply(stdout.trim(), owner, primaryUserId, sdk, bot);
+        await sendSchedulerReply(stdout.trim(), owner, primaryUserId, bot);
         dbUpsertScheduleState(primaryUserId, { last_4h_nudge_date: todayLocal });
       } else if (stderr?.trim()) {
         console.error(`[bo watch-self] scheduler 4h_nudge stderr: ${stderr.trim().slice(0, 300)}`);
@@ -582,17 +770,21 @@ async function runSchedulerTick(sdk: IMessageSDK, bot: Bot | null): Promise<void
     }
   }
 
-  const todos = dbGetTodos(owner, { includeDone: false });
-  const hasOverdue = todos.some((t) => t.due && t.due < todayLocal);
-  if (hasOverdue && (!state?.last_overdue_reminder_date || state.last_overdue_reminder_date < todayLocal)) {
-    const syntheticMessage = `[scheduled: overdue_todos] Remind the user they have overdue todos and offer to list them.`;
-    console.error(`[bo watch-self] scheduler: firing overdue_todos for user ${primaryUserId}`);
-    const { stdout, stderr, code } = await runAgent(syntheticMessage, ctxEnv);
+  const openTodos = dbGetTodos(owner, { includeDone: false });
+  if (
+    openTodos.length > 0 &&
+    isAfterDailyStarter &&
+    (!state?.last_daily_todos_date || state.last_daily_todos_date < todayLocal)
+  ) {
+    const syntheticMessage = `[scheduled: daily_todos] Remind the user of their open todos and list them all.`;
+    console.error(`[bo watch-self] scheduler: firing daily_todos for user ${primaryUserId} (${openTodos.length} open)`);
+    const dailyTodosEnv = { ...ctxEnv, BO_SCHEDULED_DAILY_TODOS: "1" };
+    const { stdout, stderr, code } = await runAgent(syntheticMessage, dailyTodosEnv);
     if (code === 0 && stdout?.trim()) {
-      await sendSchedulerReply(stdout.trim(), owner, primaryUserId, sdk, bot);
-      dbUpsertScheduleState(primaryUserId, { last_overdue_reminder_date: todayLocal });
+      await sendSchedulerReply(stdout.trim(), owner, primaryUserId, bot);
+      dbUpsertScheduleState(primaryUserId, { last_daily_todos_date: todayLocal });
     } else if (stderr?.trim()) {
-      console.error(`[bo watch-self] scheduler overdue_todos stderr: ${stderr.trim().slice(0, 300)}`);
+      console.error(`[bo watch-self] scheduler daily_todos stderr: ${stderr.trim().slice(0, 300)}`);
     }
   }
 
@@ -604,7 +796,7 @@ async function runSchedulerTick(sdk: IMessageSDK, bot: Bot | null): Promise<void
     console.error(`[bo watch-self] scheduler: firing reminder #${rem.id} for recipient ${rem.recipient_user_id}`);
     const { stdout, stderr, code } = await runAgent(syntheticMessage, remCtxEnv);
     if (code === 0 && stdout?.trim()) {
-      await sendSchedulerReply(stdout.trim(), recipientOwner, rem.recipient_user_id, sdk, bot);
+      await sendSchedulerReply(stdout.trim(), recipientOwner, rem.recipient_user_id, bot);
       if (rem.kind === "one_off") {
         dbMarkReminderSentOneOff(rem.id);
       } else {
@@ -620,73 +812,55 @@ async function sendSchedulerReply(
   stdoutStr: string,
   owner: string,
   _userId: number,
-  sdk: IMessageSDK,
   bot: Bot | null
 ): Promise<void> {
   const firstLine = stdoutStr.split("\n")[0] ?? "";
   let body = stdoutStr;
-  let sendToTelegramId: string | null = null;
   try {
     const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+    if (parsed.suppress_reply === true) return;
     if (typeof parsed.response_text === "string") body = parsed.response_text.trim();
     else if (typeof parsed.replyToSender === "string") body = parsed.replyToSender.trim();
   } catch {
     /* use full stdout */
   }
   body = sanitizeReply(body.length > 4000 ? body.slice(0, 3997) + "..." : body);
+  
+  // Telegram only
   if (owner.startsWith("telegram:")) {
     const tid = owner.slice(9);
     if (tid && bot) {
       await bot.api.sendMessage(tid, body);
     }
   } else {
-    const toNum = canonicalPhone(owner);
-    if (toNum && toNum !== "default") {
-      await sdk.send(toE164(owner), body);
-    }
+    console.error(`[bo watch-self] Scheduler reply for ${owner} skipped (not a telegram: owner, Telegram-only mode)`);
   }
 }
 
-export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<void> {
-  if (!getSelfHandle()) {
-    console.error("Set config primary_user_id in admin, or BO_MY_PHONE or BO_MY_EMAIL for self-chat. Example: BO_MY_PHONE=+1234567890");
-    process.exit(1);
-  }
-
+export async function runWatchSelf(_sdk: IMessageSDK, _args: string[]): Promise<void> {
   if (!getAgentScript()) {
     console.error("Set config agent_script in admin or BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.");
     process.exit(1);
   }
 
-  console.error("[bo watch-self] Only messages starting with 'Bo' (plus text) are passed to the agent; replies never start with 'Bo'.");
-  if (AGENT_NUMBERS.size > 0) {
-    console.error(`[bo watch-self] Self-chat or from ${[...AGENT_NUMBERS].join(", ")}: same rule — must start with 'Bo'.\n`);
-  } else {
-    console.error("");
-  }
+  console.error("[bo watch-self] Telegram-only mode. iMessage monitoring disabled.");
 
-  telegramBotInstance = createTelegramBot(sdk);
-  if (telegramBotInstance) {
-    console.error("[bo watch-self] Telegram bot enabled (BO_TELEGRAM_BOT_TOKEN set). Send /myid to your bot to get your Telegram ID, then set users.telegram_id in admin.");
-    void telegramBotInstance.start();
+  telegramBotInstance = createTelegramBot();
+  if (!telegramBotInstance) {
+    console.error("[bo watch-self] ERROR: BO_TELEGRAM_BOT_TOKEN not set. Telegram bot required.");
+    process.exit(1);
   }
+  
+  console.error("[bo watch-self] Telegram bot enabled. Send /myid to your bot to get your Telegram ID, then set users.telegram_id in admin.");
+  void telegramBotInstance.start();
 
   // Run scheduler tick immediately on startup, then every interval
-  void runSchedulerTick(sdk, telegramBotInstance);
+  void runSchedulerTick(telegramBotInstance);
   setInterval(() => {
-    void runSchedulerTick(sdk, telegramBotInstance);
+    void runSchedulerTick(telegramBotInstance);
   }, SCHEDULER_INTERVAL_MS);
   console.error("[bo watch-self] Scheduler started (interval " + SCHEDULER_INTERVAL_MS / 60000 + " min).");
 
-  await sdk.startWatching({
-    onMessage: async (msg) => {
-      await handleIncomingMessage(msg as MessageLike, sdk);
-    },
-    onError: (err) => {
-      console.error("[bo watch-self] error:", err);
-    },
-  });
-
-  // Keep process alive; startWatching() returns after registering the watcher
+  // Keep process alive
   await new Promise<never>(() => {});
 }

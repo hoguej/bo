@@ -1,4 +1,37 @@
-# bo
+# Bo - Multi-Tenant AI Assistant Platform
+
+**Bo** is a multi-tenant AI assistant platform with family groups, Telegram integration, content moderation, and rate limiting. Built with Next.js, PostgreSQL, Redis, and deployed on Railway.
+
+## Architecture
+
+**Frontend:**
+- Next.js 15 web portal
+- Telegram OAuth authentication
+- Family management dashboard
+- Server-side rendering
+
+**Backend:**
+- PostgreSQL database (multi-tenant with family isolation)
+- Redis for rate limiting
+- Persistent Telegram bot daemon
+- Hybrid AI model strategy (Gemini 3 Flash, GPT-4.1, GPT-5.2)
+
+**Features:**
+- Family-based multi-tenancy
+- Role-based access control (owner/manager/member)
+- Content moderation (PG filter)
+- Red flag detection (crisis intervention)
+- Adaptive rate limiting with escalating cooldowns
+- Per-family AI personalities
+- Todos, reminders, facts management
+
+## Deployment
+
+See [DEPLOYMENT.md](DEPLOYMENT.md) for complete Railway deployment guide.
+
+---
+
+## Legacy: iMessage Integration
 
 AI wrapper around iMessage: get messages, send to yourself, list chats, and inspect reactions. Built with [@photon-ai/imessage-kit](https://github.com/photon-hq/imessage-kit) on macOS.
 

@@ -150,6 +150,67 @@
       return `${month}/${day}/${year} ${hour}:${minute} ${dayPeriod}`;
     }
 
+    /** Check if a column name represents a timestamp. */
+    function isTimestampColumn(colName) {
+      const col = (colName || "").toLowerCase();
+      return col.endsWith("_at") || 
+             col.endsWith("_at_utc") || 
+             col.includes("time") || 
+             col.includes("date") ||
+             col === "created" ||
+             col === "updated";
+    }
+
+    /** Convert ET time string (MM/DD/YY HH:MM AM/PM) to UTC ISO string. Returns null if invalid. */
+    function parseEtToUtc(etStr) {
+      if (!etStr || !etStr.trim()) return null;
+      
+      // Try to parse "MM/DD/YY HH:MM AM/PM" format
+      const match = etStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+      if (!match) return null;
+      
+      const [, month, day, year, hour, minute, period] = match;
+      let fullYear = parseInt(year, 10);
+      if (fullYear < 100) fullYear += 2000; // Convert 2-digit year to 4-digit
+      
+      let hour24 = parseInt(hour, 10);
+      const periodUpper = period.toUpperCase();
+      if (periodUpper === "PM" && hour24 !== 12) hour24 += 12;
+      if (periodUpper === "AM" && hour24 === 12) hour24 = 0;
+      
+      // Format as ISO string representing ET local time
+      const etLocalStr = `${fullYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${String(hour24).padStart(2, '0')}:${minute}:00`;
+      
+      // Parse this as a local date, get what the browser thinks it is in UTC
+      const localDate = new Date(etLocalStr);
+      
+      // Now format this date in ET to see what ET time the browser created
+      const etCheck = localDate.toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hour12: false
+      });
+      
+      // Parse the ET check to compare
+      const etCheckMatch = etCheck.match(/(\d+)\/(\d+)\/(\d+),?\s*(\d+):(\d+)/);
+      if (etCheckMatch) {
+        const [, checkM, checkD, checkY, checkH, checkMin] = etCheckMatch;
+        // Calculate the difference
+        const wantTime = hour24 * 60 + parseInt(minute, 10);
+        const gotTime = parseInt(checkH, 10) * 60 + parseInt(checkMin, 10);
+        const wantDay = parseInt(day, 10);
+        const gotDay = parseInt(checkD, 10);
+        
+        // Adjust: add the difference to the local date
+        const diffMinutes = (wantDay - gotDay) * 24 * 60 + (wantTime - gotTime);
+        const adjusted = new Date(localDate.getTime() + diffMinutes * 60 * 1000);
+        return adjusted.toISOString();
+      }
+      
+      // Fallback: just return the local date as UTC (wrong but better than nothing)
+      return localDate.toISOString();
+    }
+
     async function api(method, path, body) {
       const opt = { method, headers: body ? { "Content-Type": "application/json" } : {} };
       if (body) opt.body = JSON.stringify(body);
@@ -278,8 +339,9 @@
             let display = val === null || val === undefined ? "" : String(val);
             const colLower = (col || "").toLowerCase();
             const tableLower = (selectedTable || "").toLowerCase();
-            const isReminderTime = tableLower === "reminders" && (colLower === "fire_at_utc" || colLower === "next_fire_at_utc");
-            if (isReminderTime && display) {
+            
+            // Format all timestamp columns in ET
+            if (isTimestampColumn(col) && display && display.match(/^\d{4}-\d{2}-\d{2}T/)) {
               display = formatUtcToEt(val);
             }
             const isLongText = tableLower === "llm_log" && (colLower === "request_doc" || colLower === "response_text");
@@ -350,7 +412,8 @@
       const fieldsEl = document.getElementById("row-modal-fields");
       fieldsEl.innerHTML = (schema.columns || []).map(c => {
         const val = c.dflt_value !== null && c.dflt_value !== undefined ? String(c.dflt_value).replace(/^'|'$/g, "") : "";
-        return `<div class="form-row"><label>${escapeHtml(c.name)}</label><input name="${escapeHtml(c.name)}" value="${escapeHtml(val)}" /></div>`;
+        const placeholder = isTimestampColumn(c.name) ? ' placeholder="MM/DD/YY HH:MM AM/PM"' : '';
+        return `<div class="form-row"><label>${escapeHtml(c.name)}</label><input name="${escapeHtml(c.name)}" value="${escapeHtml(val)}"${placeholder} /></div>`;
       }).join("");
       document.getElementById("row-modal").dataset.mode = "new";
       document.getElementById("row-modal").classList.add("visible");
@@ -364,9 +427,16 @@
       const pkCols = pkColumns();
       fieldsEl.innerHTML = (schema.columns || []).map(c => {
         const val = row[c.name];
-        const v = val === null || val === undefined ? "" : String(val);
+        let v = val === null || val === undefined ? "" : String(val);
+        
+        // Format timestamp columns in ET for editing
+        if (isTimestampColumn(c.name) && v && v.match(/^\d{4}-\d{2}-\d{2}T/)) {
+          v = formatUtcToEt(val);
+        }
+        
         const readOnly = pkCols.includes(c.name) ? " readonly" : "";
-        return `<div class="form-row"><label>${escapeHtml(c.name)}</label><input name="${escapeHtml(c.name)}" value="${escapeHtml(v)}"${readOnly} /></div>`;
+        const placeholder = isTimestampColumn(c.name) ? ' placeholder="MM/DD/YY HH:MM AM/PM"' : '';
+        return `<div class="form-row"><label>${escapeHtml(c.name)}</label><input name="${escapeHtml(c.name)}" value="${escapeHtml(v)}"${readOnly}${placeholder} /></div>`;
       }).join("");
       document.getElementById("row-modal").dataset.mode = "edit";
       document.getElementById("row-modal").dataset.rowIndex = String(rowIndex);
@@ -382,7 +452,23 @@
       const fieldsEl = document.getElementById("row-modal-fields");
       const inputs = fieldsEl.querySelectorAll("input[name], textarea[name]");
       const data = {};
-      inputs.forEach(inp => { data[inp.name] = inp.value === "" ? undefined : inp.value; });
+      inputs.forEach(inp => { 
+        let value = inp.value === "" ? undefined : inp.value;
+        
+        // Convert ET timestamps to UTC before saving
+        if (value && isTimestampColumn(inp.name)) {
+          const utcIso = parseEtToUtc(value);
+          if (utcIso) {
+            value = utcIso;
+          } else if (value.match(/^\d{4}-\d{2}-\d{2}T/)) {
+            // Already in ISO format, keep as-is
+          } else {
+            // Invalid format, let the backend handle the error
+          }
+        }
+        
+        data[inp.name] = value;
+      });
       try {
         if (mode === "new") {
           await api("POST", "/api/db/row/" + encodeURIComponent(selectedTable), data);

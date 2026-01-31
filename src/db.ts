@@ -96,7 +96,6 @@ function initSchema(database: import("bun:sqlite").Database): void {
       creator_user_id INTEGER REFERENCES users(id),
       text TEXT NOT NULL,
       done INTEGER NOT NULL DEFAULT 0,
-      due TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -120,6 +119,14 @@ function initSchema(database: import("bun:sqlite").Database): void {
       response_text TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS group_chats (
+      chat_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
   migrateOldTablesToUsers(database);
   migrateOwnerColumnsToUserId(database);
@@ -137,7 +144,9 @@ function initSchema(database: import("bun:sqlite").Database): void {
   migrateFactsRemoveSystemKeys(database);
   migrateUsersAddTimezoneIana(database);
   migrateUsersSetTimezoneEt(database);
+  migrateTodosDropDue(database);
   migrateScheduleStateTable(database);
+  migrateScheduleStateAddDailyTodosDate(database);
   migrateRemindersTable(database);
   migrateSkillsAccessNormalized(database);
   migrateReminderSkill(database);
@@ -228,6 +237,29 @@ function migrateUsersSetTimezoneEt(database: import("bun:sqlite").Database): voi
   database.run("UPDATE users SET timezone_iana = ? WHERE timezone_iana IS NULL OR trim(timezone_iana) = ''", ["America/New_York"]);
 }
 
+/** One-time: drop due column from todos (only reminders have specific times). */
+function migrateTodosDropDue(database: import("bun:sqlite").Database): void {
+  const cols = database.query("PRAGMA table_info(todos)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "due")) return;
+  const hasCreator = cols.some((c) => c.name === "creator_user_id");
+  if (hasCreator) {
+    database.run(`
+      CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, creator_user_id INTEGER REFERENCES users(id), text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+      INSERT INTO todos_new (id, user_id, creator_user_id, text, done, created_at) SELECT id, user_id, creator_user_id, text, done, created_at FROM todos;
+      DROP TABLE todos;
+      ALTER TABLE todos_new RENAME TO todos;
+    `);
+  } else {
+    database.run(`
+      CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+      INSERT INTO todos_new (id, user_id, text, done, created_at) SELECT id, user_id, text, done, created_at FROM todos;
+      DROP TABLE todos;
+      ALTER TABLE todos_new RENAME TO todos;
+    `);
+  }
+  database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
+}
+
 /** One-time: create schedule_state table (per-user scheduler idempotency). */
 function migrateScheduleStateTable(database: import("bun:sqlite").Database): void {
   database.run(`
@@ -236,10 +268,18 @@ function migrateScheduleStateTable(database: import("bun:sqlite").Database): voi
       last_convo_end_utc TEXT,
       last_daily_starter_date TEXT,
       last_4h_nudge_date TEXT,
-      last_overdue_reminder_date TEXT
+      last_overdue_reminder_date TEXT,
+      last_daily_todos_date TEXT
     )
   `);
   database.run("CREATE INDEX IF NOT EXISTS idx_schedule_state_user_id ON schedule_state(user_id)");
+}
+
+/** One-time: add last_daily_todos_date to schedule_state (daily todo reminder). */
+function migrateScheduleStateAddDailyTodosDate(database: import("bun:sqlite").Database): void {
+  const cols = database.query("PRAGMA table_info(schedule_state)").all() as { name: string }[];
+  if (cols.some((c) => c.name === "last_daily_todos_date")) return;
+  database.run("ALTER TABLE schedule_state ADD COLUMN last_daily_todos_date TEXT");
 }
 
 /** One-time: normalize skills_access_default (one row per skill_id) and skills_access_by_user (one row per user_id+skill_id for extra only). */
@@ -489,7 +529,7 @@ function migrateOwnerColumnsToUserId(database: import("bun:sqlite").Database): v
     CREATE TABLE conversation_new (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, PRIMARY KEY (user_id, seq));
     CREATE TABLE summary_new (user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, sentences TEXT NOT NULL);
     CREATE TABLE personality_new (user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, instructions TEXT NOT NULL);
-    CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, due TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
   `);
 
   const factRows = database.query("SELECT owner, key, value, scope, tags, created_at, updated_at FROM facts").all() as Array<{ owner: string; key: string; value: string; scope: string; tags: string; created_at: string; updated_at: string }>;
@@ -516,10 +556,10 @@ function migrateOwnerColumnsToUserId(database: import("bun:sqlite").Database): v
     database.run("INSERT INTO personality_new (user_id, instructions) VALUES (?, ?)", [uid, r.instructions]);
   }
 
-  const todoRows = database.query("SELECT owner, text, done, due, created_at FROM todos").all() as Array<{ owner: string; text: string; done: number; due: string | null; created_at: string }>;
+  const todoRows = database.query("SELECT owner, text, done, created_at FROM todos").all() as Array<{ owner: string; text: string; done: number; created_at: string }>;
   for (const r of todoRows) {
     const uid = r.owner === "default" ? defaultUserId : resolveOwnerToUserId(database, r.owner);
-    database.run("INSERT INTO todos_new (user_id, text, done, due, created_at) VALUES (?, ?, ?, ?, ?)", [uid, r.text, r.done, r.due, r.created_at]);
+    database.run("INSERT INTO todos_new (user_id, text, done, created_at) VALUES (?, ?, ?, ?)", [uid, r.text, r.done, r.created_at]);
   }
 
   database.run("DROP TABLE facts");
@@ -728,11 +768,11 @@ function migrateFromJson(database: import("bun:sqlite").Database, overwrite: boo
         const raw = readFileSync(todosPath, "utf-8");
         const arr = JSON.parse(raw) as unknown;
         if (Array.isArray(arr) && arr.length) {
-          const stmt = database.prepare("INSERT INTO todos (user_id, text, done, due, created_at) VALUES (?, ?, ?, ?, ?)");
+          const stmt = database.prepare("INSERT INTO todos (user_id, text, done, created_at) VALUES (?, ?, ?, ?)");
           for (const t of arr) {
-            const row = t as { text?: string; done?: boolean; due?: string; createdAt?: string };
+            const row = t as { text?: string; done?: boolean; createdAt?: string };
             if (row && typeof row.text === "string") {
-              stmt.run(userId, row.text, row.done ? 1 : 0, row.due ?? null, row.createdAt ?? new Date().toISOString());
+              stmt.run(userId, row.text, row.done ? 1 : 0, row.createdAt ?? new Date().toISOString());
             }
           }
         }
@@ -854,7 +894,8 @@ export function dbInsertRow(tableName: string, data: Record<string, unknown>): {
   const database = getDb();
   const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
   if (safe !== tableName) return { error: "Invalid table name" };
-  const entries = Object.entries(data).filter(([, v]) => v !== undefined) as [string, unknown][];
+  let entries = Object.entries(data).filter(([, v]) => v !== undefined) as [string, unknown][];
+  if (safe === "todos") entries = entries.filter(([k]) => k !== "due");
   const cols = entries.map(([k]) => k.replace(/[^a-zA-Z0-9_]/g, "")).filter((c) => c.length > 0);
   if (entries.length !== cols.length || cols.some((c) => c.length === 0)) return { error: "Invalid column name" };
   const values = entries.map(([, v]) => v);
@@ -873,7 +914,8 @@ export function dbUpdateRow(tableName: string, pk: Record<string, unknown>, data
   if (safe !== tableName) return { error: "Invalid table name" };
   const pkCols = dbGetPkColumns(tableName);
   if (pkCols.length === 0) return { error: "No primary key" };
-  const setCols = Object.keys(data).filter((k) => data[k] !== undefined && !pkCols.includes(k)).map((k) => k.replace(/[^a-zA-Z0-9_]/g, ""));
+  let setCols = Object.keys(data).filter((k) => data[k] !== undefined && !pkCols.includes(k)).map((k) => k.replace(/[^a-zA-Z0-9_]/g, ""));
+  if (safe === "todos") setCols = setCols.filter((c) => c !== "due");
   if (setCols.length === 0) return { error: "No columns to update" };
   const setClause = setCols.map((c) => `${c} = ?`).join(", ");
   const whereClause = pkCols.map((c) => `${c} = ?`).join(" AND ");
@@ -904,8 +946,8 @@ export function dbDeleteRow(tableName: string, pk: Record<string, unknown>): { c
 }
 
 // --- Users (contacts) ---
-function userDisplayName(first: string, last: string): string {
-  return [first, last].map((s) => s.trim()).filter(Boolean).join(" ") || "";
+function userDisplayName(first: string | null, last: string | null): string {
+  return [first, last].filter(Boolean).map((s) => s!.trim()).filter(Boolean).join(" ") || "";
 }
 
 export function dbGetContactsNumberToName(): Map<string, string> {
@@ -917,6 +959,11 @@ export function dbGetContactsNumberToName(): Map<string, string> {
     if (num.length >= 10) map.set(num, userDisplayName(r.first_name, r.last_name));
   }
   return map;
+}
+
+export function dbGetAllUsers(): Array<{ id: number; first_name: string | null; last_name: string | null; telegram_id: string | null; phone_number: string }> {
+  const database = getDb();
+  return database.query("SELECT id, first_name, last_name, telegram_id, phone_number FROM users").all() as Array<{ id: number; first_name: string | null; last_name: string | null; telegram_id: string | null; phone_number: string }>;
 }
 
 export function dbGetContactsNameToNumber(): Map<string, string> {
@@ -1222,14 +1269,27 @@ export function dbGetFacts(owner: string): Array<{ key: string; value: string; s
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
   if (userId == null) return [];
-  return database.query("SELECT key, value, scope, tags, created_at AS createdAt, updated_at AS updatedAt FROM facts WHERE user_id = ?").all(userId) as Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }>;
+  
+  // Get both user-specific facts and global facts (stored with user_id=1, scope='global')
+  const userFacts = database.query("SELECT key, value, scope, tags, created_at AS createdAt, updated_at AS updatedAt FROM facts WHERE user_id = ?").all(userId) as Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }>;
+  
+  // Get global facts if this isn't already the default user
+  if (userId !== 1) {
+    const globalFacts = database.query("SELECT key, value, scope, tags, created_at AS createdAt, updated_at AS updatedAt FROM facts WHERE user_id = 1 AND scope = 'global'").all() as Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }>;
+    return [...globalFacts, ...userFacts];
+  }
+  
+  return userFacts;
 }
 
 export function dbUpsertFact(owner: string, key: string, value: string, scope: string, tags: string[]): void {
   if (isReservedFactKey(key)) return;
   const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
+  
+  // Global facts are stored with user_id=1 regardless of who creates them
+  const userId = scope === 'global' ? 1 : resolveOwnerToUserId(database, owner);
   if (userId == null) return;
+  
   const now = new Date().toISOString();
   const tagsJson = JSON.stringify(tags);
   database.run(
@@ -1353,7 +1413,7 @@ export function dbGetPersonality(owner: string): string {
 }
 
 // --- Todos ---
-export type TodoRow = { id: number; text: string; done: number; due: string | null; createdAt: string; creator_user_id: number | null };
+export type TodoRow = { id: number; text: string; done: number; createdAt: string; creator_user_id: number | null };
 
 export function dbGetTodos(owner: string, opts?: { includeDone?: boolean }): TodoRow[] {
   const database = getDb();
@@ -1362,20 +1422,20 @@ export function dbGetTodos(owner: string, opts?: { includeDone?: boolean }): Tod
   const includeDone = opts?.includeDone === true;
   const where = includeDone ? "user_id = ?" : "user_id = ? AND done = 0";
   return database.query(
-    `SELECT id, text, done, due, created_at AS createdAt, creator_user_id FROM todos WHERE ${where} ORDER BY id ASC`
+    `SELECT id, text, done, created_at AS createdAt, creator_user_id FROM todos WHERE ${where} ORDER BY id ASC`
   ).all(userId) as TodoRow[];
 }
 
 /** Add a todo. Returns the new todo id, or undefined if owner could not be resolved. */
-export function dbAddTodo(owner: string, text: string, due: string | null, creatorOwner?: string): number | undefined {
+export function dbAddTodo(owner: string, text: string, creatorOwner?: string): number | undefined {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
   if (userId == null) return undefined;
   const creatorUserId = creatorOwner != null ? resolveOwnerToUserId(database, creatorOwner) : userId;
   const now = new Date().toISOString();
   const result = database.run(
-    "INSERT INTO todos (user_id, creator_user_id, text, done, due, created_at) VALUES (?, ?, ?, 0, ?, ?)",
-    [userId, creatorUserId ?? userId, text, due, now]
+    "INSERT INTO todos (user_id, creator_user_id, text, done, created_at) VALUES (?, ?, ?, 0, ?)",
+    [userId, creatorUserId ?? userId, text, now]
   ) as { lastInsertRowid?: number };
   return result.lastInsertRowid ?? undefined;
 }
@@ -1385,7 +1445,7 @@ export function dbGetTodoById(owner: string, id: number): TodoRow | null {
   const userId = resolveOwnerToUserId(database, owner);
   if (userId == null) return null;
   const row = database.query(
-    "SELECT id, text, done, due, created_at AS createdAt, creator_user_id FROM todos WHERE user_id = ? AND id = ?"
+    "SELECT id, text, done, created_at AS createdAt, creator_user_id FROM todos WHERE user_id = ? AND id = ?"
   ).get(userId, id) as TodoRow | undefined;
   return row ?? null;
 }
@@ -1414,14 +1474,6 @@ export function dbUpdateTodoText(owner: string, id: number, text: string): boole
   return (result as { changes: number }).changes > 0;
 }
 
-export function dbUpdateTodoDue(owner: string, id: number, due: string): boolean {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return false;
-  const result = database.run("UPDATE todos SET due = ? WHERE user_id = ? AND id = ?", [due, userId, id]);
-  return (result as { changes: number }).changes > 0;
-}
-
 // --- Schedule state (scheduler idempotency) ---
 export type ScheduleStateRow = {
   user_id: number;
@@ -1429,13 +1481,14 @@ export type ScheduleStateRow = {
   last_daily_starter_date: string | null;
   last_4h_nudge_date: string | null;
   last_overdue_reminder_date: string | null;
+  last_daily_todos_date: string | null;
 };
 
 export function dbGetScheduleState(userId: number): ScheduleStateRow | null {
   const database = getDb();
   const row = database
     .query(
-      "SELECT user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date FROM schedule_state WHERE user_id = ?"
+      "SELECT user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date, last_daily_todos_date FROM schedule_state WHERE user_id = ?"
     )
     .get(userId) as ScheduleStateRow | undefined;
   return row ?? null;
@@ -1443,19 +1496,20 @@ export function dbGetScheduleState(userId: number): ScheduleStateRow | null {
 
 export function dbUpsertScheduleState(
   userId: number,
-  updates: Partial<Pick<ScheduleStateRow, "last_convo_end_utc" | "last_daily_starter_date" | "last_4h_nudge_date" | "last_overdue_reminder_date">>
+  updates: Partial<Pick<ScheduleStateRow, "last_convo_end_utc" | "last_daily_starter_date" | "last_4h_nudge_date" | "last_overdue_reminder_date" | "last_daily_todos_date">>
 ): void {
   const database = getDb();
   const existing = dbGetScheduleState(userId);
   if (!existing) {
     database.run(
-      "INSERT INTO schedule_state (user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date) VALUES (?, ?, ?, ?, ?)",
+      "INSERT INTO schedule_state (user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date, last_daily_todos_date) VALUES (?, ?, ?, ?, ?, ?)",
       [
         userId,
         updates.last_convo_end_utc ?? null,
         updates.last_daily_starter_date ?? null,
         updates.last_4h_nudge_date ?? null,
         updates.last_overdue_reminder_date ?? null,
+        updates.last_daily_todos_date ?? null,
       ]
     );
     return;
@@ -1477,6 +1531,10 @@ export function dbUpsertScheduleState(
   if (updates.last_overdue_reminder_date !== undefined) {
     setParts.push("last_overdue_reminder_date = ?");
     values.push(updates.last_overdue_reminder_date);
+  }
+  if (updates.last_daily_todos_date !== undefined) {
+    setParts.push("last_daily_todos_date = ?");
+    values.push(updates.last_daily_todos_date);
   }
   if (setParts.length === 0) return;
   values.push(userId);
@@ -1639,6 +1697,35 @@ export function dbDeleteReminder(id: number): boolean {
   const database = getDb();
   const result = database.run("DELETE FROM reminders WHERE id = ?", [id]) as { changes: number };
   return result.changes > 0;
+}
+
+// --- Group Chats ---
+export function dbUpsertGroupChat(chatId: string, name: string, type: string): void {
+  const database = getDb();
+  const now = new Date().toISOString();
+  database.run(
+    `INSERT INTO group_chats (chat_id, name, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(chat_id) DO UPDATE SET name = ?, type = ?, updated_at = ?`,
+    [chatId, name, type, now, now, name, type, now]
+  );
+}
+
+export function dbGetGroupChatByChatId(chatId: string): { chat_id: string; name: string; type: string } | null {
+  const database = getDb();
+  const row = database.query("SELECT chat_id, name, type FROM group_chats WHERE chat_id = ?").get(chatId) as { chat_id: string; name: string; type: string } | undefined;
+  return row ?? null;
+}
+
+export function dbGetGroupChatByName(name: string): { chat_id: string; name: string; type: string } | null {
+  const database = getDb();
+  const nameLower = name.toLowerCase();
+  const row = database.query("SELECT chat_id, name, type FROM group_chats WHERE LOWER(name) = ?").get(nameLower) as { chat_id: string; name: string; type: string } | undefined;
+  return row ?? null;
+}
+
+export function dbGetAllGroupChats(): Array<{ chat_id: string; name: string; type: string }> {
+  const database = getDb();
+  return database.query("SELECT chat_id, name, type FROM group_chats ORDER BY name").all() as Array<{ chat_id: string; name: string; type: string }>;
 }
 
 /** Check if user can modify reminder: creator or recipient. */

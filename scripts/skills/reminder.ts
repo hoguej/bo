@@ -39,6 +39,7 @@ type Input = {
   at?: string;
   recurrence?: string;
   for_contact?: string;
+  for_contacts?: string[];
   reminder_id?: number;
   new_text?: string;
   new_fire_at_iso?: string;
@@ -158,6 +159,73 @@ async function main() {
   const numberToName = getNumberToName();
 
   if (action === "list") {
+    // List reminders for multiple contacts
+    const forContacts = Array.isArray(input.for_contacts) ? (input.for_contacts as string[]) : [];
+    if (forContacts.length > 0) {
+      const sections: string[] = [];
+      for (const contactName of forContacts) {
+        const trimmed = contactName.trim();
+        if (!trimmed) continue;
+        const num = resolveContactToNumber(trimmed);
+        if (!num) {
+          sections.push(`${trimmed}: I don't know who that is.`);
+          continue;
+        }
+        const contactUserId = dbResolveOwnerToUserId(num);
+        if (!contactUserId) {
+          sections.push(`${trimmed}: Couldn't find them in the system.`);
+          continue;
+        }
+        const reminders = dbGetRemindersForUser(contactUserId, "for_me");
+        const contactUser = dbGetUserById(contactUserId);
+        const contactDisplayName = getUserDisplayName(contactUser, numberToName, trimmed);
+        if (reminders.length === 0) {
+          sections.push(`${contactDisplayName}: No reminders`);
+        } else {
+          const lines = reminders.map((r) => {
+            const creator = dbGetUserById(r.creator_user_id);
+            const creatorName = getUserDisplayName(creator, numberToName);
+            const recipientTz = dbGetUserTimezone(r.recipient_user_id);
+            return "  " + formatReminderForDisplay(r, creatorName, contactDisplayName, recipientTz);
+          });
+          sections.push(`${contactDisplayName}:\n` + lines.join("\n"));
+        }
+      }
+      writeOutput(sections.join("\n\n"));
+      process.exit(0);
+    }
+    
+    // List reminders for a specific contact
+    const forContact = (input.for_contact ?? "").trim();
+    if (forContact) {
+      const num = resolveContactToNumber(forContact);
+      if (!num) {
+        writeOutput(`I don't know who ${forContact} is.`);
+        process.exit(0);
+      }
+      const contactUserId = dbResolveOwnerToUserId(num);
+      if (!contactUserId) {
+        writeOutput(`Couldn't find ${forContact} in the system.`);
+        process.exit(0);
+      }
+      const reminders = dbGetRemindersForUser(contactUserId, "for_me");
+      if (reminders.length === 0) {
+        writeOutput(`${forContact} has no reminders.`);
+        process.exit(0);
+      }
+      const contactUser = dbGetUserById(contactUserId);
+      const contactDisplayName = getUserDisplayName(contactUser, numberToName, forContact);
+      const lines = reminders.map((r) => {
+        const creator = dbGetUserById(r.creator_user_id);
+        const creatorName = getUserDisplayName(creator, numberToName);
+        const recipientTz = dbGetUserTimezone(r.recipient_user_id);
+        return formatReminderForDisplay(r, creatorName, contactDisplayName, recipientTz);
+      });
+      writeOutput(`${contactDisplayName}'s reminders:\n` + lines.join("\n"));
+      process.exit(0);
+    }
+    
+    // List reminders for the requester
     const filter = input.filter === "for_me" ? "for_me" : input.filter === "by_me" ? "by_me" : undefined;
     const reminders = dbGetRemindersForUser(creatorUserId, filter);
     if (reminders.length === 0) {
@@ -182,6 +250,64 @@ async function main() {
       writeOutput("Reminder text is required.");
       process.exit(0);
     }
+
+    // Multi-recipient: for_contacts array
+    const forContacts = Array.isArray(input.for_contacts) && input.for_contacts.length > 0 ? input.for_contacts : undefined;
+    if (forContacts) {
+      const fireAtIso = (input.fire_at_iso ?? "").trim();
+      const timeStr = (input.time ?? input.at ?? "").trim();
+      const recurrence = (input.recurrence ?? "").trim() || null;
+      const kind = recurrence ? "recurring" : "one_off";
+      const creatorTz = dbGetUserTimezone(creatorUserId);
+      let fireAtUtc: string | null = null;
+      let nextFireAtUtc: string | null = null;
+      if (fireAtIso) {
+        const d = new Date(fireAtIso);
+        if (!Number.isNaN(d.getTime())) {
+          fireAtUtc = d.toISOString();
+          if (kind === "recurring") nextFireAtUtc = fireAtUtc;
+        }
+      }
+      if (!fireAtUtc && timeStr) {
+        const parsed = parseTimeString(timeStr);
+        if (parsed) {
+          fireAtUtc = nextOccurrenceUTC(parsed.hour, parsed.minute, creatorTz);
+          if (kind === "recurring") nextFireAtUtc = fireAtUtc;
+        }
+      }
+      if (kind === "one_off" && !fireAtUtc) {
+        writeOutput("For a one-off reminder, provide a time (e.g. 7:30 or 7:30 AM) or fire_at_iso (UTC).");
+        process.exit(0);
+      }
+      if (kind === "recurring" && !nextFireAtUtc) {
+        writeOutput("For a recurring reminder, provide fire_at_iso for the first run and recurrence (e.g. daily 08:30).");
+        process.exit(0);
+      }
+
+      const created: Array<{ name: string; id: number }> = [];
+      for (const contactName of forContacts) {
+        const num = resolveContactToNumber(contactName.trim());
+        if (num) {
+          const recUserId = dbResolveOwnerToUserId(num);
+          if (recUserId != null) {
+            const id = dbAddReminder(creatorUserId, recUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc);
+            const recipient = dbGetUserById(recUserId);
+            const recipientName = getUserDisplayName(recipient, numberToName, contactName.trim());
+            created.push({ name: recipientName, id });
+          }
+        }
+      }
+      if (created.length === 0) {
+        writeOutput("Couldn't find any of those contacts.");
+        process.exit(0);
+      }
+      const names = created.map(c => c.name).join(" and ");
+      const when = fireAtUtc ? formatUtcInTz(fireAtUtc, creatorTz) : (recurrence || "—");
+      writeOutput(`Reminder set for ${names} at ${when}: "${text}".`);
+      process.exit(0);
+    }
+
+    // Single recipient
     const recipientUserId = resolveRecipientUserId(input.for_contact, requestorOwner);
     const tz = dbGetUserTimezone(recipientUserId);
     const fireAtIso = (input.fire_at_iso ?? "").trim();

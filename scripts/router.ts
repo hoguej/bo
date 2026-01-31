@@ -507,7 +507,8 @@ async function main() {
   const conversationBlock = formatConversationForPrompt(recentMessages);
   const summaryBlock = getSummaryForPrompt(owner);
   const personalityBlock = getPersonalityForPrompt(owner);
-  const skillsForDecision = isScheduledReminder ? allowedSkills.filter((s) => s.id !== "todo") : allowedSkills;
+  // For scheduled reminders we still allow todo list (only block creating todos); daily_todos uses "[scheduled: daily_todos]" so isScheduledReminder is false.
+  const skillsForDecision = allowedSkills;
   const skillsSummary = skillsForDecision.map((s) => ({ id: s.id, name: s.name, description: s.description, inputSchema: s.inputSchema }));
   const contactsList = getContactsList();
   const contactNames = contactsList.length > 0 ? contactsList.map((c) => c.name).join(", ") : "(none)";
@@ -565,9 +566,17 @@ async function main() {
     appendConversation(owner, userMessage, randomExcuse());
     return;
   }
-  if (isScheduledReminder && (decision.skill === "todo" || decision.skill === "friend_mode" || decision.skill === "reminder")) {
-    logErr(`scheduled reminder chose ${decision.skill}; overriding to create_a_response`);
-    decision = { skill: "create_a_response" };
+  if (isScheduledReminder) {
+    if (decision.skill === "friend_mode" || decision.skill === "reminder") {
+      logErr(`scheduled reminder chose ${decision.skill}; overriding to create_a_response`);
+      decision = { skill: "create_a_response" };
+    } else if (decision.skill === "todo") {
+      const action = String((decision as Record<string, unknown>).action ?? "").toLowerCase();
+      if (action === "add" || action === "add_many") {
+        logErr(`scheduled reminder chose todo ${action}; overriding to create_a_response (only list/view allowed)`);
+        decision = { skill: "create_a_response" };
+      }
+    }
   }
   if (decision.personality_instruction && typeof decision.personality_instruction === "string" && decision.personality_instruction.trim()) {
     appendPersonalityInstruction(owner, decision.personality_instruction.trim());
@@ -575,6 +584,7 @@ async function main() {
   logErr(`decision: skill=${decision.skill}`);
 
   let finalReply: string;
+  let suppressReply = false;
 
   if (decision.skill === "friend_mode") {
     function normalizeFriendKey(s: string): string | undefined {
@@ -619,64 +629,177 @@ async function main() {
   } else if (decision.skill === "create_a_response") {
     finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, "", {}, memoryPath, reminderContext);
   } else if (decision.skill === "send_to_contact") {
-    const from = String(decision.from ?? "").trim();
     const to = String(decision.to ?? "").trim();
+    const toContacts = Array.isArray((decision as Record<string, unknown>).to_contacts) ? ((decision as Record<string, unknown>).to_contacts as string[]) : undefined;
     const aiPrompt = String(decision.ai_prompt ?? "").trim();
-    const sendToNumber = to ? resolveContactToNumber(to) : undefined;
-    const displayName = to ? to.charAt(0).toUpperCase() + to.slice(1).toLowerCase() : "that person";
-    if (!to || !aiPrompt) {
-      logErr("send_to_contact missing to or ai_prompt");
+    const recipients = toContacts && toContacts.length > 0 ? toContacts : (to ? [to] : []);
+    
+    if (recipients.length === 0 || !aiPrompt) {
+      logErr("send_to_contact missing recipients or ai_prompt");
       process.stdout.write("I need a contact and what to say.");
       appendConversation(owner, userMessage, "I need a contact and what to say.");
       return;
     }
-    if (sendToNumber === undefined) {
-      logErr(`send_to_contact unknown contact: to=${to}`);
-      process.stdout.write(`I don't know who ${displayName} is.`);
-      appendConversation(owner, userMessage, `I don't know who ${displayName} is.`);
-      return;
+
+    // Determine sender name from owner
+    let from: string;
+    const numberToName = getNumberToName();
+    if (owner.startsWith("telegram:")) {
+      const tid = owner.slice(9).trim();
+      const uid = tid ? dbGetUserIdByTelegramId(tid) : undefined;
+      if (uid != null) {
+        const u = dbGetUserById(uid);
+        const first = (u?.first_name ?? "").trim();
+        const contactName = u?.phone_number ? numberToName.get(u.phone_number) : undefined;
+        from = first || (contactName ? contactName.split(/\s+/)[0] : undefined) || contactName || "Bo";
+      } else {
+        from = "Bo";
+      }
+    } else {
+      const contactName = numberToName.get(owner);
+      from = contactName ? contactName.split(/\s+/)[0] : (owner === "default" ? "Bo" : "Bo");
     }
-    if (sendToNumber.length < 10) {
-      logErr(`send_to_contact no valid number for to=${to}`);
-      process.stdout.write(`I have ${displayName} in contacts but no valid phone number.`);
-      appendConversation(owner, userMessage, `I have ${displayName} in contacts but no valid phone number.`);
-      return;
-    }
+
+    // Multi-recipient: send personalized message to each with their context
     const recipientPrompt = loadPrompt("skills/send_to_contact_recipient") || "Generate a message to the recipient. The message must say who it is from. Return plain text only.";
-    const recipientUser = [
-      "from:", from,
-      "to:", to,
-      "ai_prompt:", aiPrompt,
-      "personality:", personalityBlock || "(none)",
-      "facts:", factsBlock || "(none)",
-      "conversation_summary:", summaryBlock || "(none)",
-      "recent_conversations:", conversationBlock || "(none)",
-    ].join("\n");
-    const sendBodyRaw = await callLlmWithPrompt(openai, model, requestId, owner, "send_to_contact_recipient", recipientPrompt, recipientUser, 0.3);
-    const sendBody = sendBodyRaw.trim().length > 2000 ? sendBodyRaw.trim().slice(0, 1997) + "..." : sendBodyRaw.trim() || `${from} says: (no message)`;
+    const sent: string[] = [];
+    for (const recipientName of recipients) {
+      const sendToNumber = resolveContactToNumber(recipientName.trim());
+      if (!sendToNumber || sendToNumber.length < 10) {
+        logErr(`send_to_contact: can't resolve ${recipientName}`);
+        continue;
+      }
+      const recipientOwner = sendToNumber;
+      const recipientMemoryPath = getMemoryPathForOwner(recipientOwner);
+      const recipientFacts = formatFactsForPrompt(getRelevantFacts(aiPrompt, { max: 12, path: recipientMemoryPath }));
+      const recipientConvo = formatConversationForPrompt(getRecentMessages(recipientOwner, maxMessages - 1));
+      const recipientSummary = getSummaryForPrompt(recipientOwner);
+      const recipientPersonality = getPersonalityForPrompt(recipientOwner);
+      const recipientUser = [
+        "from:", from,
+        "to:", recipientName.trim(),
+        "ai_prompt:", aiPrompt,
+        "personality:", recipientPersonality || "(none)",
+        "facts:", recipientFacts || "(none)",
+        "conversation_summary:", recipientSummary || "(none)",
+        "recent_conversations:", recipientConvo || "(none)",
+      ].join("\n");
+      const sendBodyRaw = await callLlmWithPrompt(openai, model, requestId + "_send_" + sendToNumber.slice(-4), recipientOwner, "send_to_contact_recipient", recipientPrompt, recipientUser, 0.3);
+      const sendBody = sendBodyRaw.trim().length > 2000 ? sendBodyRaw.trim().slice(0, 1997) + "..." : sendBodyRaw.trim() || `${from} says: (no message)`;
+      const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+      const displayName = getNumberToName().get(sendToNumber) ?? recipientName.trim();
+      sent.push({ number: sendToNumber, name: displayName.split(/\s+/)[0] ?? displayName, body: sendBody, telegramId: sendToTelegramId });
+    }
+
+    if (sent.length === 0) {
+      process.stdout.write("Couldn't find any of those contacts.");
+      appendConversation(owner, userMessage, "Couldn't find any of those contacts.");
+      return;
+    }
 
     const senderPrompt = loadPrompt("skills/send_to_contact_sender") || "Generate a short ack to the sender (e.g. Okay, sent that to Cara.). Return plain text only.";
+    const toList = sent.map(s => s.name).join(", ").replace(/, ([^,]+)$/, ", and $1");
     const senderUser = [
       "user_message:", userMessage,
-      "what_was_sent:", sendBody.slice(0, 200),
-      "to:", to,
+      "to:", toList,
       "personality:", personalityBlock || "(none)",
       "facts:", factsBlock || "(none)",
       "conversation_summary:", summaryBlock || "(none)",
       "recent_conversations:", conversationBlock || "(none)",
     ].join("\n");
     const replyToSenderRaw = await callLlmWithPrompt(openai, model, requestId, owner, "send_to_contact_sender", senderPrompt, senderUser, 0.3);
-    const replyToSenderText = replyToSenderRaw.trim() || `Okay, sent that to ${displayName}.`;
+    finalReply = replyToSenderRaw.trim() || `Okay, sent to ${toList}.`;
+    
+    // Output all messages with the ack in the last one
+    for (let i = 0; i < sent.length; i++) {
+      const s = sent[i];
+      const isLast = i === sent.length - 1;
+      const payload: Record<string, string> = {
+        sendTo: s.number,
+        sendBody: s.body,
+        replyToSender: isLast ? finalReply : "",
+      };
+      if (s.telegramId) payload.sendToTelegramId = s.telegramId;
+      process.stdout.write(JSON.stringify(payload) + "\n");
+    }
+    
+    appendConversation(owner, userMessage, finalReply);
+    return;
+  } else if (decision.skill === "send_to_group") {
+    const groupName = String(decision.group_name ?? "").trim();
+    const message = String(decision.message ?? "").trim();
+    
+    if (!groupName || !message) {
+      logErr("send_to_group missing group_name or message");
+      process.stdout.write("I need a group name and message.");
+      appendConversation(owner, userMessage, "I need a group name and message.");
+      return;
+    }
 
-    const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+    // Run the skill to validate and get group info
+    const skill = getSkillById("send_to_group");
+    if (!skill) {
+      logErr("send_to_group skill not found");
+      process.stdout.write("Group messaging is not available.");
+      appendConversation(owner, userMessage, "Group messaging is not available.");
+      return;
+    }
+
+    const skillInput = { group_name: groupName, message };
+    logErr(`next: run skill send_to_group (${skill.entrypoint})`);
+    const skillEnv = { BO_REQUEST_ID: requestId, BO_REQUEST_FROM: fromRaw ?? owner };
+    const { stdout, stderr, code } = await callSkill(skill.entrypoint, skillInput, skillEnv);
+    if (stderr?.trim()) logErr(`skill stderr: ${stderr.trim().slice(0, 1000)}${stderr.length > 1000 ? "…" : ""}`);
+    if (code !== 0) {
+      logErr(`send_to_group skill failed exitCode=${code}`);
+      finalReply = "I couldn't send that to the group.";
+      process.stdout.write(finalReply);
+      appendConversation(owner, userMessage, finalReply);
+      return;
+    }
+
+    const rawSkillOutput = stdout || "Done.";
+    let skillResponse: string;
+    let skillHints: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(rawSkillOutput) as Record<string, unknown>;
+      if (typeof parsed.response === "string") {
+        skillResponse = parsed.response;
+        if (parsed.hints && typeof parsed.hints === "object") skillHints = parsed.hints as Record<string, unknown>;
+      } else {
+        skillResponse = rawSkillOutput;
+      }
+    } catch {
+      skillResponse = rawSkillOutput;
+    }
+
+    // If skill didn't provide group info, error out
+    if (!skillHints.send_to_group || !skillHints.group_chat_id) {
+      finalReply = skillResponse;
+      process.stdout.write(finalReply);
+      appendConversation(owner, userMessage, finalReply);
+      return;
+    }
+
+    // Formulate message using sender's personality
+    const groupMessagePrompt = loadPrompt("skills/send_to_group_message") || "Generate a message for the group. Return plain text only.";
+    const groupUser = [
+      "sender_name:", fromRaw ?? owner,
+      "message_intent:", message,
+      "personality:", personalityBlock || "(none)",
+      "facts:", factsBlock || "(none)",
+    ].join("\n");
+    const groupMessageRaw = await callLlmWithPrompt(openai, model, requestId + "_group", owner, "send_to_group_message", groupMessagePrompt, groupUser, 0.3);
+    const groupMessage = groupMessageRaw.trim() || message;
+
+    // Output hint for daemon to send to group
     const payload: Record<string, string> = {
-      sendTo: sendToNumber,
-      sendBody,
-      replyToSender: replyToSenderText.length > 2000 ? replyToSenderText.slice(0, 1997) + "..." : replyToSenderText,
+      sendToGroup: String(skillHints.group_chat_id),
+      sendBody: groupMessage,
+      replyToSender: skillResponse,
     };
-    if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
     process.stdout.write(JSON.stringify(payload) + "\n");
-    appendConversation(owner, userMessage, replyToSenderText);
+    appendConversation(owner, userMessage, skillResponse);
     return;
   } else {
     const skillId = decision.skill;
@@ -720,52 +843,103 @@ async function main() {
     } catch {
       skillResponse = rawSkillOutput;
     }
+    if (skillHints.suppress_reply === true) suppressReply = true;
     finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, skillResponse, skillHints, memoryPath, reminderContext);
 
-    // When someone modifies another person's todo list, notify that person.
+    // When someone modifies another person's todo list, notify that person (or people).
     if (skillId === "todo" && code === 0) {
       const forContact = (input.for_contact as string)?.trim();
-      if (forContact) {
+      const forContacts = Array.isArray((skillHints as Record<string, unknown>).for_contacts) ? ((skillHints as Record<string, unknown>).for_contacts as string[]) : undefined;
+      const recipients = forContacts && forContacts.length > 0 ? forContacts : (forContact ? [forContact] : []);
+      if (recipients.length > 0) {
         const numberToName = getNumberToName();
-        const sendToNumber = resolveContactToNumber(forContact);
-        const senderName = numberToName.get(owner) ?? (owner === "default" ? "Someone" : owner);
+        let senderName: string;
+        if (owner.startsWith("telegram:")) {
+          const tid = owner.slice(9).trim();
+          const uid = tid ? dbGetUserIdByTelegramId(tid) : undefined;
+          if (uid != null) {
+            const u = dbGetUserById(uid);
+            const first = (u?.first_name ?? "").trim();
+            const contactName = u?.phone_number ? numberToName.get(u.phone_number) : undefined;
+            senderName = first || (contactName ? contactName.split(/\s+/)[0] : undefined) || contactName || "Someone";
+          } else {
+            senderName = "Someone";
+          }
+        } else {
+          senderName = numberToName.get(owner) ?? (owner === "default" ? "Someone" : owner);
+        }
         const action = String((input.action as string) ?? "add").toLowerCase();
         const text = (input.text as string)?.trim();
         const num = input.number as number | undefined;
-        const due = (input.due as string)?.trim();
-        let notification: string;
+        let baseNotification: string;
         if (action === "add" && text) {
-          notification = `${senderName} added a todo to your list: ${text}`;
+          baseNotification = `${senderName} added a todo to your list: ${text}`;
         } else if (action === "mark_done" && num != null) {
-          notification = `${senderName} marked #${num} done on your list.`;
+          baseNotification = `${senderName} marked #${num} done on your list.`;
         } else if (action === "remove" && num != null) {
-          notification = `${senderName} removed #${num} from your list.`;
+          baseNotification = `${senderName} removed #${num} from your list.`;
         } else if (action === "edit" && num != null && text) {
-          notification = `${senderName} updated #${num} on your list to: ${text}`;
-        } else if (action === "set_due" && num != null && due) {
-          notification = `${senderName} set #${num} due to ${due} on your list.`;
+          baseNotification = `${senderName} updated #${num} on your list to: ${text}`;
         } else {
-          notification = `${senderName} made a change to your todo list.`;
+          baseNotification = `${senderName} made a change to your todo list.`;
         }
-        if (sendToNumber) {
-          const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+        
+        const notifications: Array<{ number: string; body: string; telegramId?: string }> = [];
+        for (const contactName of recipients) {
+          const sendToNumber = resolveContactToNumber(contactName.trim());
+          if (sendToNumber) {
+            const recipientOwner = sendToNumber;
+            const recipientMemoryPath = getMemoryPathForOwner(recipientOwner);
+            const recipientFacts = formatFactsForPrompt(getRelevantFacts(baseNotification, { max: 8, path: recipientMemoryPath }));
+            const recipientConvo = formatConversationForPrompt(getRecentMessages(recipientOwner, 8));
+            const recipientSummary = getSummaryForPrompt(recipientOwner);
+            const recipientPersonality = getPersonalityForPrompt(recipientOwner);
+            
+            const notificationPrompt = loadPrompt("create_response") || "Rephrase for the user in Bo's personality.";
+            const notificationUser = [
+              "user_message:", baseNotification,
+              "skill_output:", baseNotification,
+              "personality:", recipientPersonality || "(none)",
+              "facts:", recipientFacts || "(none)",
+              "conversation_summary:", recipientSummary || "(none)",
+              "recent_conversations:", recipientConvo || "(none)",
+            ].join("\n");
+            const personalizedRaw = await callLlmWithPrompt(openai, model, requestId + "_notif_" + sendToNumber.slice(-4), recipientOwner, "todo_notification", notificationPrompt, notificationUser, 0.3);
+            const personalizedNotification = personalizedRaw.trim() || baseNotification;
+            const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+            notifications.push({
+              number: sendToNumber,
+              body: personalizedNotification.length > 2000 ? personalizedNotification.slice(0, 1997) + "..." : personalizedNotification,
+              telegramId: sendToTelegramId,
+            });
+          }
+        }
+        
+        // Output all notifications with ack in the last one
+        for (let i = 0; i < notifications.length; i++) {
+          const n = notifications[i];
+          const isLast = i === notifications.length - 1;
           const payload: Record<string, string> = {
-            sendTo: sendToNumber,
-            sendBody: notification.length > 2000 ? notification.slice(0, 1997) + "..." : notification,
-            replyToSender: finalReply.length > 2000 ? finalReply.slice(0, 1997) + "..." : finalReply,
+            sendTo: n.number,
+            sendBody: n.body,
+            replyToSender: isLast ? (finalReply.length > 2000 ? finalReply.slice(0, 1997) + "..." : finalReply) : "",
           };
-          if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
+          if (n.telegramId) payload.sendToTelegramId = n.telegramId;
           process.stdout.write(JSON.stringify(payload) + "\n");
-          appendConversation(owner, userMessage, finalReply);
-          return;
         }
+        appendConversation(owner, userMessage, finalReply);
+        return;
       }
     }
   }
 
   if (finalReply.length > 2000) finalReply = finalReply.slice(0, 1997) + "...";
-  process.stdout.write(finalReply);
-  appendConversation(owner, userMessage, finalReply);
+  if (suppressReply) {
+    process.stdout.write(JSON.stringify({ response_text: finalReply, suppress_reply: true }) + "\n");
+  } else {
+    process.stdout.write(finalReply);
+    appendConversation(owner, userMessage, finalReply);
+  }
 
   // Optional: run summary step (current_summary + recent_conversations → replace summary).
   const summaryPrompt = loadPrompt("summary");
