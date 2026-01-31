@@ -8,7 +8,7 @@ if [[ -z "$msg" ]]; then
   exit 1
 fi
 
-# Project root (parent of scripts/) so router/skills can find config/contacts.json etc.
+# Project root (parent of scripts/) so router/skills can find prompts, skills, etc.
 BO_PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export BO_PROJECT_ROOT
 cd "$BO_PROJECT_ROOT"

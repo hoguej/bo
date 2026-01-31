@@ -37,7 +37,7 @@ All non-secret data and config live in a single SQLite database:
 
 Passwords and API keys stay in `.env` / `.env.local`; only non-token config and data are stored in the DB.
 
-**Moving data from JSON into the DB:** Your data may still be in JSON files (`config/contacts.json`, `skills/registry.json`, `skills/access.json`, and under `~/.bo/`: `memory.json`, `conversation.json`, `summary.json`, `personality.json`, `todos.json`, plus per-owner variants like `memory_7404749170.json`). To move that data into the DB now:
+**Moving data from JSON into the DB:** Your data may still be in JSON files (`skills/registry.json`, `skills/access.json`, and under `~/.bo/`: `memory.json`, `conversation.json`, `summary.json`, `personality.json`, `todos.json`, plus per-owner variants like `memory_7404749170.json`). Contacts (users) are managed in the DB only (admin UI). To move other data into the DB now:
 
 ```bash
 bo migrate

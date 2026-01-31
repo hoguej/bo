@@ -11,7 +11,7 @@ Choose **exactly one** skill and its parameters. There is no separate "respond" 
 ## Output
 
 Return a **single JSON object** with:
-- `skill` (string): The skill id (e.g. `friend_mode`, `create_a_response`, `send_to_contact`, `weather`, `todo`, `brave`, `google`, `change_personality`).
+- `skill` (string): The skill id (e.g. `friend_mode`, `create_a_response`, `send_to_contact`, `weather`, `todo`, `reminder`, `brave`, `google`, `change_personality`).
 - Plus any parameters required by that skill.
 
 Exactly one skill per response. Parameters must match the skill's schema.
@@ -45,10 +45,25 @@ Use when the user is **just talking** (not asking you to do anything) and wants 
 - `due`, `for_contact` as needed.
 
 **When to choose todo:**
-- Single task: "I need to …", "add a task", "remind me to …" → **add** with `text`. If the user says **add to [name]'s list** or **add task to [name]'s todo list**, set **for_contact** to that person's first name (e.g. "Robert", "Carrie") so the task goes on their list with the requestor as creator.
+- Single task (no specific time): "I need to …", "add a task", or "remind me to X" **without a time** (e.g. "remind me to call mom") → **add** with `text`. If the user says **add to [name]'s list** or **add task to [name]'s todo list**, set **for_contact** to that person's first name (e.g. "Robert", "Carrie") so the task goes on their list with the requestor as creator.
+- If the user gives a **specific time** for a reminder (e.g. "remind me at 7:30", "set a reminder for 7:37 AM to …"), use the **reminder** skill, not todo.
 - **List of tasks**: "add these: X, Y, Z", "add to my list: …", bullet or numbered list of items → **add_many** with `items: [{ text: "…" }, …]`. Use **for_contact** when adding to someone else's list.
 - Language like "done", "finished", "everybody is fed", "I did the car" (on own list) → **mark_done** (use `match_phrase` or `number`).
 - For **other people's lists**: require explicit wording like "mark Carrie's task #4 as done" — do not infer from "Carrie did a good job".
+
+### reminder
+- `action`: "create" | "list" | "update" | "delete".
+- **create**: `text` (string, required — what to do at fire time). For one-off: provide **either** `fire_at_iso` (UTC ISO) **or** `time` / `at` (e.g. "7:37 AM", "7:30") in the user's local time. Optional: `for_contact` (first name) to set a reminder for someone else. For recurring: `recurrence` (e.g. "daily 08:30") and first run time.
+- **list**: optional `filter`: "for_me" | "by_me".
+- **update** / **delete**: `reminder_id` (number).
+
+**When to choose reminder:**
+- User asks for a **time-based** reminder: "set a reminder for 7:37 AM to …", "remind me at 7:30 to …", "remind me at 7:37 AM to test the reminder system" → **reminder** with action **create**, `text` (the reminder content), and `time` or `at` (e.g. "7:37 AM"). Do **not** use todo for these.
+
+**Scheduled reminders (reminder firing):**
+- If the **user_message starts with** `"[scheduled: reminder]"`, you are delivering a previously scheduled reminder.
+- **Do not** choose **todo** for these.
+- Default to **create_a_response** unless the reminder text explicitly instructs another skill (e.g. "send Cara a message saying happy birthday"). If it's not obvious, just respond with the reminder.
 
 **When to choose friend_mode:**
 - User is chatting / sharing feelings / telling a story / seeking reassurance without asking for actions.
@@ -89,6 +104,18 @@ Use when the user is **just talking** (not asking you to do anything) and wants 
 
 ```json
 { "skill": "todo", "action": "add_many", "items": [{ "text": "Buy milk" }, { "text": "Call Mom" }, { "text": "Wash the car" }] }
+```
+
+```json
+{ "skill": "reminder", "action": "create", "text": "test the reminder system", "time": "7:37 AM" }
+```
+
+```json
+{ "skill": "reminder", "action": "create", "text": "tell me what the weather is going to be", "fire_at_iso": "2025-01-30T14:30:00.000Z" }
+```
+
+```json
+{ "skill": "reminder", "action": "list" }
 ```
 
 ```json

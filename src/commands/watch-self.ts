@@ -10,6 +10,16 @@ import {
   dbGetPrimaryUserPhone,
   dbHasRepliedToMessage,
   dbMarkMessageReplied,
+  dbResolveOwnerToUserId,
+  dbUpdateLastConvoEndUtc,
+  dbGetScheduleState,
+  dbUpsertScheduleState,
+  dbGetUserTimezone,
+  dbGetDueReminders,
+  dbMarkReminderSentOneOff,
+  dbAdvanceRecurringReminder,
+  dbGetOwnerByUserId,
+  dbGetTodos,
 } from "../db";
 import { canonicalPhone, toE164 } from "../phone";
 
@@ -202,6 +212,7 @@ function createTelegramBot(sdk: IMessageSDK): Bot | null {
           }
           await ctx.reply(replyText);
           lastReplyAt = Date.now();
+          if (userId != null) dbUpdateLastConvoEndUtc(userId);
           return;
         }
         if (typeof parsed.response_text === "string") reply = parsed.response_text.trim();
@@ -213,6 +224,7 @@ function createTelegramBot(sdk: IMessageSDK): Bot | null {
     if (reply.length > 4000) reply = reply.slice(0, 3997) + "...";
     await ctx.reply(reply);
     lastReplyAt = Date.now();
+    if (userId != null) dbUpdateLastConvoEndUtc(userId);
   });
 
   return bot;
@@ -364,6 +376,9 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
     return;
   }
 
+  const recipientUserId = dbResolveOwnerToUserId(replyTo);
+  if (recipientUserId != null) dbUpdateLastConvoEndUtc(recipientUserId);
+
   const requestId = newRequestId();
   const ctxEnv: Record<string, string> = {
     BO_REQUEST_ID: requestId,
@@ -435,6 +450,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         if (latest?.isFromMe && latest.guid) sentMessageGuids.add(latest.guid);
       }
       dbMarkMessageReplied(guid);
+      if (recipientUserId != null) dbUpdateLastConvoEndUtc(recipientUserId);
       lastReplyAt = Date.now();
     } else {
       recentSentReplyTexts.add(bodyToSend);
@@ -457,6 +473,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
         if (latest?.isFromMe && latest.guid) sentMessageGuids.add(latest.guid);
       }
       dbMarkMessageReplied(guid);
+      if (recipientUserId != null) dbUpdateLastConvoEndUtc(recipientUserId);
       lastReplyAt = Date.now();
     }
   } else {
@@ -480,7 +497,153 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
       }
     }
     dbMarkMessageReplied(guid);
+    if (recipientUserId != null) dbUpdateLastConvoEndUtc(recipientUserId);
     lastReplyAt = Date.now();
+  }
+}
+
+/** User-local date (YYYY-MM-DD) and time (HH:mm) in IANA timezone. */
+function getLocalDateAndTime(tz: string): { date: string; hour: number; minute: number } {
+  const now = new Date();
+  const datePart = new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(now);
+  const [y, m, d] = datePart.split("-").map(Number);
+  const date = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  const timePart = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).format(now);
+  const [hour, minute] = timePart.split(":").map(Number);
+  return { date, hour, minute };
+}
+
+/** Next fire for recurring: 24h from now (refinable later to snap to recurrence time in user TZ). */
+function getNextFireRecurring(): string {
+  return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+}
+
+const SCHEDULER_INTERVAL_MS = 1 * 60 * 1000; // 1 minute for precise reminder firing
+const DAILY_STARTER_HOUR = 9;
+const DAILY_STARTER_MINUTE = 30;
+const NUDGE_WINDOW_START = { hour: 9, minute: 30 };
+const NUDGE_WINDOW_END = { hour: 20, minute: 0 };
+
+async function runSchedulerTick(sdk: IMessageSDK, bot: Bot | null): Promise<void> {
+  const primaryUserIdStr = dbGetConfig("primary_user_id")?.trim();
+  if (!primaryUserIdStr) return;
+  const primaryUserId = parseInt(primaryUserIdStr, 10);
+  if (Number.isNaN(primaryUserId)) return;
+  const owner = dbGetOwnerByUserId(primaryUserId);
+  const tz = dbGetUserTimezone(primaryUserId);
+  const state = dbGetScheduleState(primaryUserId);
+  const { date: todayLocal, hour, minute } = getLocalDateAndTime(tz);
+  const nowIso = new Date().toISOString();
+
+  const script = getAgentScript();
+  if (!script) return;
+
+  const ctxEnv: Record<string, string> = {
+    BO_REQUEST_ID: newRequestId(),
+    BO_REQUEST_FROM: owner,
+    BO_REQUEST_TO: "scheduler",
+    BO_REQUEST_IS_SELF_CHAT: "true",
+    BO_REQUEST_IS_FROM_ME: "false",
+    BO_ROUTER_DEBUG: "1",
+  };
+
+  const localMinutes = hour * 60 + minute;
+  const windowStartMinutes = NUDGE_WINDOW_START.hour * 60 + NUDGE_WINDOW_START.minute;
+  const windowEndMinutes = NUDGE_WINDOW_END.hour * 60 + NUDGE_WINDOW_END.minute;
+  const isInWindow = localMinutes >= windowStartMinutes && localMinutes < windowEndMinutes;
+  const isAfterDailyStarter = localMinutes >= DAILY_STARTER_HOUR * 60 + DAILY_STARTER_MINUTE;
+
+  if (isAfterDailyStarter && (!state?.last_daily_starter_date || state.last_daily_starter_date < todayLocal)) {
+    const syntheticMessage = `[scheduled: daily_starter] Start a friendly daily check-in.`;
+    console.error(`[bo watch-self] scheduler: firing daily_starter for user ${primaryUserId}`);
+    const { stdout, stderr, code } = await runAgent(syntheticMessage, ctxEnv);
+    if (code === 0 && stdout?.trim()) {
+      await sendSchedulerReply(stdout.trim(), owner, primaryUserId, sdk, bot);
+      dbUpsertScheduleState(primaryUserId, { last_daily_starter_date: todayLocal });
+    } else if (stderr?.trim()) {
+      console.error(`[bo watch-self] scheduler daily_starter stderr: ${stderr.trim().slice(0, 300)}`);
+    }
+  }
+
+  if (isInWindow && state?.last_convo_end_utc) {
+    const lastConvoMs = new Date(state.last_convo_end_utc).getTime();
+    const fourHoursMs = 4 * 60 * 60 * 1000;
+    const lastNudgeDate = state.last_4h_nudge_date ?? "";
+    if (Date.now() - lastConvoMs >= fourHoursMs && lastNudgeDate < todayLocal) {
+      const syntheticMessage = `[scheduled: 4h_nudge] It's been a while since we chatted—send a short, friendly nudge.`;
+      console.error(`[bo watch-self] scheduler: firing 4h_nudge for user ${primaryUserId}`);
+      const { stdout, stderr, code } = await runAgent(syntheticMessage, ctxEnv);
+      if (code === 0 && stdout?.trim()) {
+        await sendSchedulerReply(stdout.trim(), owner, primaryUserId, sdk, bot);
+        dbUpsertScheduleState(primaryUserId, { last_4h_nudge_date: todayLocal });
+      } else if (stderr?.trim()) {
+        console.error(`[bo watch-self] scheduler 4h_nudge stderr: ${stderr.trim().slice(0, 300)}`);
+      }
+    }
+  }
+
+  const todos = dbGetTodos(owner, { includeDone: false });
+  const hasOverdue = todos.some((t) => t.due && t.due < todayLocal);
+  if (hasOverdue && (!state?.last_overdue_reminder_date || state.last_overdue_reminder_date < todayLocal)) {
+    const syntheticMessage = `[scheduled: overdue_todos] Remind the user they have overdue todos and offer to list them.`;
+    console.error(`[bo watch-self] scheduler: firing overdue_todos for user ${primaryUserId}`);
+    const { stdout, stderr, code } = await runAgent(syntheticMessage, ctxEnv);
+    if (code === 0 && stdout?.trim()) {
+      await sendSchedulerReply(stdout.trim(), owner, primaryUserId, sdk, bot);
+      dbUpsertScheduleState(primaryUserId, { last_overdue_reminder_date: todayLocal });
+    } else if (stderr?.trim()) {
+      console.error(`[bo watch-self] scheduler overdue_todos stderr: ${stderr.trim().slice(0, 300)}`);
+    }
+  }
+
+  const dueReminders = dbGetDueReminders(nowIso);
+  for (const rem of dueReminders) {
+    const recipientOwner = dbGetOwnerByUserId(rem.recipient_user_id);
+    const remCtxEnv = { ...ctxEnv, BO_REQUEST_FROM: recipientOwner };
+    const syntheticMessage = `[scheduled: reminder] ${rem.text}`;
+    console.error(`[bo watch-self] scheduler: firing reminder #${rem.id} for recipient ${rem.recipient_user_id}`);
+    const { stdout, stderr, code } = await runAgent(syntheticMessage, remCtxEnv);
+    if (code === 0 && stdout?.trim()) {
+      await sendSchedulerReply(stdout.trim(), recipientOwner, rem.recipient_user_id, sdk, bot);
+      if (rem.kind === "one_off") {
+        dbMarkReminderSentOneOff(rem.id);
+      } else {
+        dbAdvanceRecurringReminder(rem.id, getNextFireRecurring());
+      }
+    } else if (stderr?.trim()) {
+      console.error(`[bo watch-self] scheduler reminder #${rem.id} stderr: ${stderr.trim().slice(0, 300)}`);
+    }
+  }
+}
+
+async function sendSchedulerReply(
+  stdoutStr: string,
+  owner: string,
+  _userId: number,
+  sdk: IMessageSDK,
+  bot: Bot | null
+): Promise<void> {
+  const firstLine = stdoutStr.split("\n")[0] ?? "";
+  let body = stdoutStr;
+  let sendToTelegramId: string | null = null;
+  try {
+    const parsed = JSON.parse(firstLine) as Record<string, unknown>;
+    if (typeof parsed.response_text === "string") body = parsed.response_text.trim();
+    else if (typeof parsed.replyToSender === "string") body = parsed.replyToSender.trim();
+  } catch {
+    /* use full stdout */
+  }
+  body = sanitizeReply(body.length > 4000 ? body.slice(0, 3997) + "..." : body);
+  if (owner.startsWith("telegram:")) {
+    const tid = owner.slice(9);
+    if (tid && bot) {
+      await bot.api.sendMessage(tid, body);
+    }
+  } else {
+    const toNum = canonicalPhone(owner);
+    if (toNum && toNum !== "default") {
+      await sdk.send(toE164(owner), body);
+    }
   }
 }
 
@@ -507,6 +670,13 @@ export async function runWatchSelf(sdk: IMessageSDK, _args: string[]): Promise<v
     console.error("[bo watch-self] Telegram bot enabled (BO_TELEGRAM_BOT_TOKEN set). Send /myid to your bot to get your Telegram ID, then set users.telegram_id in admin.");
     void telegramBotInstance.start();
   }
+
+  // Run scheduler tick immediately on startup, then every interval
+  void runSchedulerTick(sdk, telegramBotInstance);
+  setInterval(() => {
+    void runSchedulerTick(sdk, telegramBotInstance);
+  }, SCHEDULER_INTERVAL_MS);
+  console.error("[bo watch-self] Scheduler started (interval " + SCHEDULER_INTERVAL_MS / 60000 + " min).");
 
   await sdk.startWatching({
     onMessage: async (msg) => {

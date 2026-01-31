@@ -76,6 +76,39 @@ function logBlock(title: string, body: string) {
   console.error(`\n[bo router] ${title}\n${body}\n`);
 }
 
+type LlmMockConfig = {
+  responses: Record<string, unknown>;
+  recordPath?: string;
+  defaultResponse?: unknown;
+};
+
+let llmMockCache: LlmMockConfig | null | undefined;
+
+function loadLlmMock(): LlmMockConfig | null {
+  if (llmMockCache !== undefined) return llmMockCache;
+  const mockPath = getEnv("BO_LLM_MOCK_PATH");
+  if (!mockPath) {
+    llmMockCache = null;
+    return null;
+  }
+  try {
+    const raw = readFileSync(mockPath, "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const responses =
+      parsed && typeof parsed === "object" && parsed.responses && typeof parsed.responses === "object"
+        ? (parsed.responses as Record<string, unknown>)
+        : (parsed as Record<string, unknown>);
+    const recordPath = (parsed?.record_path as string | undefined) || (parsed?.recordPath as string | undefined) || getEnv("BO_LLM_MOCK_RECORD_PATH");
+    const defaultResponse = (parsed?.default as unknown) ?? undefined;
+    llmMockCache = { responses, recordPath, defaultResponse };
+    return llmMockCache;
+  } catch (e) {
+    console.error("[bo router] Failed to load BO_LLM_MOCK_PATH:", e instanceof Error ? e.message : String(e));
+    llmMockCache = null;
+    return null;
+  }
+}
+
 const PROJECT_ROOT = dirname(__dirname);
 
 /** Load prompt content from prompts/<name>.md or prompts/skills/<name>.md. Returns empty string if file missing. */
@@ -284,6 +317,21 @@ async function callLlmWithPrompt(
   temperature: number = 0.1
 ): Promise<string> {
   const requestDoc = { model, messages: [{ role: "system" as const, content: systemContent }, { role: "user" as const, content: userContent }] };
+  const mock = loadLlmMock();
+  if (mock) {
+    const value = step in mock.responses ? mock.responses[step] : mock.defaultResponse;
+    const raw = typeof value === "string" ? value : value == null ? "" : JSON.stringify(value);
+    logPromptResponse(requestId, owner, step, requestDoc, raw);
+    if (mock.recordPath) {
+      try {
+        const record = { step, request: requestDoc, response: raw, at: new Date().toISOString() };
+        appendFileSync(mock.recordPath, JSON.stringify(record) + "\n", "utf-8");
+      } catch (e) {
+        console.error("[bo router] Failed to write LLM mock record:", e instanceof Error ? e.message : String(e));
+      }
+    }
+    return raw;
+  }
   const completion = await openai.chat.completions.create({
     model,
     messages: [{ role: "system", content: systemContent }, { role: "user", content: userContent }],
@@ -385,6 +433,13 @@ async function main() {
 
   logErr(`messageLen=${userMessage.length} from=${getEnv("BO_REQUEST_FROM") ?? "?"} to=${getEnv("BO_REQUEST_TO") ?? "?"}`);
 
+  const scheduledReminderPrefix = "[scheduled: reminder] ";
+  const isScheduledReminder = userMessage.startsWith(scheduledReminderPrefix);
+  const scheduledReminderText = isScheduledReminder ? userMessage.slice(scheduledReminderPrefix.length).trim() : "";
+  const reminderContext: Record<string, string> = isScheduledReminder
+    ? { reminder_triggered: "true", reminder_text: scheduledReminderText || "(reminder)" }
+    : {};
+
   const registry = loadSkillsRegistry();
   const context = buildContext();
 
@@ -452,7 +507,8 @@ async function main() {
   const conversationBlock = formatConversationForPrompt(recentMessages);
   const summaryBlock = getSummaryForPrompt(owner);
   const personalityBlock = getPersonalityForPrompt(owner);
-  const skillsSummary = allowedSkills.map((s) => ({ id: s.id, name: s.name, description: s.description, inputSchema: s.inputSchema }));
+  const skillsForDecision = isScheduledReminder ? allowedSkills.filter((s) => s.id !== "todo") : allowedSkills;
+  const skillsSummary = skillsForDecision.map((s) => ({ id: s.id, name: s.name, description: s.description, inputSchema: s.inputSchema }));
   const contactsList = getContactsList();
   const contactNames = contactsList.length > 0 ? contactsList.map((c) => c.name).join(", ") : "(none)";
 
@@ -485,7 +541,7 @@ async function main() {
   const whatToDoPrompt = loadPrompt("what_to_do") || "Choose exactly one skill and its parameters. Return a single JSON object: { skill: string, ...params }. Use skill create_a_response for general chat. Use skill send_to_contact with from, to, ai_prompt when sending to a contact.";
   const syntheticSkills: Array<{ id: string; name: string; description: string; inputSchema: unknown }> = [];
   if (!allowedSkills.some((s) => s.id === "create_a_response")) syntheticSkills.push({ id: "create_a_response", name: "Reply to user", description: "General chat or reply", inputSchema: {} });
-  if (!allowedSkills.some((s) => s.id === "friend_mode"))
+  if (!isScheduledReminder && !allowedSkills.some((s) => s.id === "friend_mode"))
     syntheticSkills.push({
       id: "friend_mode",
       name: "Friend mode",
@@ -508,6 +564,10 @@ async function main() {
     process.stdout.write(randomExcuse());
     appendConversation(owner, userMessage, randomExcuse());
     return;
+  }
+  if (isScheduledReminder && (decision.skill === "todo" || decision.skill === "friend_mode" || decision.skill === "reminder")) {
+    logErr(`scheduled reminder chose ${decision.skill}; overriding to create_a_response`);
+    decision = { skill: "create_a_response" };
   }
   if (decision.personality_instruction && typeof decision.personality_instruction === "string" && decision.personality_instruction.trim()) {
     appendPersonalityInstruction(owner, decision.personality_instruction.trim());
@@ -557,7 +617,7 @@ async function main() {
       }
     );
   } else if (decision.skill === "create_a_response") {
-    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, "", {}, memoryPath);
+    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, "", {}, memoryPath, reminderContext);
   } else if (decision.skill === "send_to_contact") {
     const from = String(decision.from ?? "").trim();
     const to = String(decision.to ?? "").trim();
@@ -660,7 +720,7 @@ async function main() {
     } catch {
       skillResponse = rawSkillOutput;
     }
-    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, skillResponse, skillHints, memoryPath);
+    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, skillResponse, skillHints, memoryPath, reminderContext);
 
     // When someone modifies another person's todo list, notify that person.
     if (skillId === "todo" && code === 0) {

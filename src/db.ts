@@ -135,6 +135,12 @@ function initSchema(database: import("bun:sqlite").Database): void {
   migrateLlmLogAddUserId(database);
   migrateTodosAddCreator(database);
   migrateFactsRemoveSystemKeys(database);
+  migrateUsersAddTimezoneIana(database);
+  migrateUsersSetTimezoneEt(database);
+  migrateScheduleStateTable(database);
+  migrateRemindersTable(database);
+  migrateSkillsAccessNormalized(database);
+  migrateReminderSkill(database);
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_request_id ON llm_log(request_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_owner ON llm_log(owner)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_user_id ON llm_log(user_id)");
@@ -208,6 +214,151 @@ function migrateTodosAddCreator(database: import("bun:sqlite").Database): void {
   } catch (_) {
     /* table may not exist yet */
   }
+}
+
+/** One-time: add timezone_iana to users (IANA timezone for schedule/reminders; fallback BO_DEFAULT_TZ). */
+function migrateUsersAddTimezoneIana(database: import("bun:sqlite").Database): void {
+  const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
+  if (cols.some((c) => c.name === "timezone_iana")) return;
+  database.run("ALTER TABLE users ADD COLUMN timezone_iana TEXT");
+}
+
+/** One-time: set all users to ET (America/New_York) where timezone_iana is null or empty. */
+function migrateUsersSetTimezoneEt(database: import("bun:sqlite").Database): void {
+  database.run("UPDATE users SET timezone_iana = ? WHERE timezone_iana IS NULL OR trim(timezone_iana) = ''", ["America/New_York"]);
+}
+
+/** One-time: create schedule_state table (per-user scheduler idempotency). */
+function migrateScheduleStateTable(database: import("bun:sqlite").Database): void {
+  database.run(`
+    CREATE TABLE IF NOT EXISTS schedule_state (
+      user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      last_convo_end_utc TEXT,
+      last_daily_starter_date TEXT,
+      last_4h_nudge_date TEXT,
+      last_overdue_reminder_date TEXT
+    )
+  `);
+  database.run("CREATE INDEX IF NOT EXISTS idx_schedule_state_user_id ON schedule_state(user_id)");
+}
+
+/** One-time: normalize skills_access_default (one row per skill_id) and skills_access_by_user (one row per user_id+skill_id for extra only). */
+function migrateSkillsAccessNormalized(database: import("bun:sqlite").Database): void {
+  const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
+  const hasAllowed = defaultCols.some((c) => c.name === "allowed");
+  if (!hasAllowed) return;
+
+  const defaultRow = database.query("SELECT allowed FROM skills_access_default WHERE id = 1").get() as { allowed: string } | undefined;
+  let defaultList: string[] = [];
+  if (defaultRow) {
+    try {
+      const arr = JSON.parse(defaultRow.allowed) as unknown;
+      defaultList = Array.isArray(arr) ? (arr as string[]).filter((x) => typeof x === "string") : [];
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  const defaultSet = new Set(defaultList);
+
+  database.run("CREATE TABLE IF NOT EXISTS skills_access_default_new (skill_id TEXT NOT NULL PRIMARY KEY)");
+  for (const skillId of defaultList) {
+    if (skillId) database.run("INSERT OR IGNORE INTO skills_access_default_new (skill_id) VALUES (?)", [skillId]);
+  }
+
+  database.run(`
+    CREATE TABLE IF NOT EXISTS skills_access_by_user_new (
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      skill_id TEXT NOT NULL,
+      PRIMARY KEY (user_id, skill_id)
+    )
+  `);
+  const byUserRows = database.query("SELECT user_id, allowed FROM skills_access_by_user").all() as { user_id: number; allowed: string }[];
+  for (const r of byUserRows) {
+    try {
+      const arr = JSON.parse(r.allowed) as unknown;
+      const allowed = Array.isArray(arr) ? (arr as string[]).filter((x) => typeof x === "string") : [];
+      const extra = allowed.filter((s) => !defaultSet.has(s));
+      for (const skillId of extra) {
+        if (skillId) database.run("INSERT OR IGNORE INTO skills_access_by_user_new (user_id, skill_id) VALUES (?, ?)", [r.user_id, skillId]);
+      }
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  database.run("DROP TABLE skills_access_by_user");
+  database.run("DROP TABLE skills_access_default");
+  database.run("ALTER TABLE skills_access_by_user_new RENAME TO skills_access_by_user");
+  database.run("ALTER TABLE skills_access_default_new RENAME TO skills_access_default");
+}
+
+/** One-time: insert reminder skill into registry if not present, and add to default skills access. */
+function migrateReminderSkill(database: import("bun:sqlite").Database): void {
+  const row = database.query("SELECT 1 FROM skills_registry WHERE id = ?").get("reminder") as { "1": number } | undefined;
+  if (!row) {
+    const inputSchema = JSON.stringify({
+      action: "create | list | update | delete",
+      text: "string (task to run at fire time; required for create)",
+      fire_at_iso: "string (UTC ISO time for one-off or first run; e.g. 2025-01-30T16:30:00.000Z)",
+      recurrence: "string (e.g. daily 08:30 for recurring)",
+      for_contact: "string (recipient first name; default self)",
+      reminder_id: "number (for update/delete)",
+      new_text: "string (for update)",
+      new_fire_at_iso: "string (for update)",
+      new_recurrence: "string (for update)",
+      filter: "for_me | by_me (for list)",
+    });
+    database.run(
+      "INSERT INTO skills_registry (id, name, description, entrypoint, input_schema) VALUES (?, ?, ?, ?, ?)",
+      [
+        "reminder",
+        "Reminders",
+        "Set, list, update, or cancel one-off and recurring reminders for yourself or others. Create: text, fire_at_iso (UTC), optional recurrence (e.g. daily 08:30), optional for_contact. List: optional filter for_me/by_me. Update/delete: reminder_id.",
+        "scripts/skills/reminder.ts",
+        inputSchema,
+      ]
+    );
+  }
+  const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
+  const hasSkillId = defaultCols.some((c) => c.name === "skill_id");
+  if (hasSkillId) {
+    database.run("INSERT OR IGNORE INTO skills_access_default (skill_id) VALUES (?)", ["reminder"]);
+  } else {
+    const defaultRow = database.query("SELECT allowed FROM skills_access_default WHERE id = 1").get() as { allowed: string } | undefined;
+    if (defaultRow) {
+      try {
+        const allowed = JSON.parse(defaultRow.allowed) as unknown;
+        const list = Array.isArray(allowed) ? (allowed as string[]).filter((x) => typeof x === "string") : [];
+        if (!list.includes("reminder")) {
+          list.push("reminder");
+          database.run("UPDATE skills_access_default SET allowed = ? WHERE id = 1", [JSON.stringify(list)]);
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/** One-time: create reminders table (one-off and recurring; creator + recipient). */
+function migrateRemindersTable(database: import("bun:sqlite").Database): void {
+  database.run(`
+    CREATE TABLE IF NOT EXISTS reminders (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      creator_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      recipient_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      text TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('one_off', 'recurring')),
+      fire_at_utc TEXT,
+      recurrence TEXT,
+      next_fire_at_utc TEXT,
+      created_at TEXT NOT NULL,
+      sent_at TEXT,
+      last_fired_at TEXT
+    )
+  `);
+  database.run("CREATE INDEX IF NOT EXISTS idx_reminders_recipient_next ON reminders(recipient_user_id, next_fire_at_utc)");
+  database.run("CREATE INDEX IF NOT EXISTS idx_reminders_fire_at ON reminders(fire_at_utc) WHERE kind = 'one_off'");
 }
 
 /** One-time: add owner column to llm_log so we can trace every request/response to request_id and user. */
@@ -398,28 +549,7 @@ function migrateFromJson(database: import("bun:sqlite").Database, overwrite: boo
       database.run("DELETE FROM skills_access_by_user");
       database.run("DELETE FROM users");
     }
-    const contactsPath = process.env.BO_CONTACTS_PATH?.trim() && existsSync(process.env.BO_CONTACTS_PATH!)
-      ? process.env.BO_CONTACTS_PATH!
-      : join(projectRoot, "config", "contacts.json");
-    if (existsSync(contactsPath)) {
-      try {
-        const raw = readFileSync(contactsPath, "utf-8");
-        const obj = JSON.parse(raw) as Record<string, unknown>;
-        if (obj && typeof obj === "object") {
-          const stmt = database.prepare("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)");
-          for (const [name, value] of Object.entries(obj)) {
-            if (typeof value !== "string" || !name.trim()) continue;
-            const num = canonicalPhone(value.trim());
-            if (num.length < 10) continue;
-            const [first = "", ...rest] = name.trim().split(/\s+/);
-            const last = rest.join(" ").trim();
-            stmt.run(first, last, num);
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
+    // Users/contacts are managed in the DB (admin UI or legacy migration from old contacts table). No JSON import.
   }
 
   const registryCount = (database.query("SELECT COUNT(*) AS c FROM skills_registry").get() as { c: number })?.c ?? 0;
@@ -446,7 +576,6 @@ function migrateFromJson(database: import("bun:sqlite").Database, overwrite: boo
   const accessDefaultCount = (database.query("SELECT COUNT(*) AS c FROM skills_access_default").get() as { c: number })?.c ?? 0;
   const doAccess = overwrite || accessDefaultCount === 0;
   if (doAccess) {
-    if (overwrite) database.run("DELETE FROM skills_access_default");
     const accessPath = join(projectRoot, "skills", "access.json");
     if (existsSync(accessPath)) {
       try {
@@ -454,21 +583,47 @@ function migrateFromJson(database: import("bun:sqlite").Database, overwrite: boo
         const parsed = JSON.parse(raw) as { version?: number; default?: string[]; byNumber?: Record<string, string[]> };
         if (parsed?.version === 1) {
           const defaultAllowed = Array.isArray(parsed.default) ? parsed.default : [];
-          database.run("INSERT INTO skills_access_default (id, allowed) VALUES (1, ?)", [JSON.stringify(defaultAllowed)]);
+          const defaultSet = new Set(defaultAllowed);
           const byNumber = parsed.byNumber && typeof parsed.byNumber === "object" ? parsed.byNumber : {};
-          for (const [num, allowed] of Object.entries(byNumber)) {
-            if (!Array.isArray(allowed)) continue;
-            const canonical = canonicalPhone(num);
-            if (canonical.length < 10) continue;
-            const userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
-            let userId: number;
-            if (userRow) {
-              userId = userRow.id;
-            } else {
-              database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
-              userId = (database.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
+          const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
+          const hasSkillId = defaultCols.some((c) => c.name === "skill_id");
+          if (hasSkillId) {
+            if (overwrite) database.run("DELETE FROM skills_access_default");
+            const stmtDefault = database.prepare("INSERT INTO skills_access_default (skill_id) VALUES (?)");
+            for (const skillId of defaultAllowed) {
+              if (skillId?.trim()) stmtDefault.run(skillId.trim());
             }
-            database.run("INSERT OR REPLACE INTO skills_access_by_user (user_id, allowed) VALUES (?, ?)", [userId, JSON.stringify(allowed)]);
+            if (overwrite) database.run("DELETE FROM skills_access_by_user");
+            for (const [num, allowed] of Object.entries(byNumber)) {
+              if (!Array.isArray(allowed)) continue;
+              const canonical = canonicalPhone(num);
+              if (canonical.length < 10) continue;
+              let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
+              if (!userRow) {
+                database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
+                userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
+              }
+              const extra = allowed.filter((s) => typeof s === "string" && s.trim() && !defaultSet.has(s.trim()));
+              const stmtUser = database.prepare("INSERT INTO skills_access_by_user (user_id, skill_id) VALUES (?, ?)");
+              for (const skillId of extra) {
+                if (skillId?.trim()) stmtUser.run(userRow.id, skillId.trim());
+              }
+            }
+          } else {
+            if (overwrite) database.run("DELETE FROM skills_access_default");
+            database.run("INSERT INTO skills_access_default (id, allowed) VALUES (1, ?)", [JSON.stringify(defaultAllowed)]);
+            if (overwrite) database.run("DELETE FROM skills_access_by_user");
+            for (const [num, allowed] of Object.entries(byNumber)) {
+              if (!Array.isArray(allowed)) continue;
+              const canonical = canonicalPhone(num);
+              if (canonical.length < 10) continue;
+              let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
+              if (!userRow) {
+                database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
+                userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
+              }
+              database.run("INSERT OR REPLACE INTO skills_access_by_user (user_id, allowed) VALUES (?, ?)", [userRow.id, JSON.stringify(allowed)]);
+            }
           }
         }
       } catch {
@@ -827,6 +982,20 @@ export function dbGetPrimaryUserPhone(): string | undefined {
   return row?.phone_number;
 }
 
+/** Resolve owner string (default, phone, or telegram:<id>) to user_id. For use when updating schedule state (e.g. last_convo_end_utc). */
+export function dbResolveOwnerToUserId(owner: string): number | undefined {
+  return resolveOwnerToUserId(getDb(), owner?.trim() || "default");
+}
+
+/** Get owner string (phone or telegram:<id>) for a user_id. Used by scheduler to set BO_REQUEST_FROM and send reply. */
+export function dbGetOwnerByUserId(userId: number): string {
+  const database = getDb();
+  const row = database.query("SELECT phone_number, telegram_id FROM users WHERE id = ?").get(userId) as { phone_number: string; telegram_id: string | null } | undefined;
+  if (!row) return "default";
+  if (row.telegram_id?.trim()) return "telegram:" + row.telegram_id.trim();
+  return row.phone_number === "default" ? "default" : row.phone_number;
+}
+
 /** Resolve Telegram user id to user_id (for allowlist). Returns undefined if no user has that telegram_id. */
 export function dbGetUserIdByTelegramId(telegramId: string): number | undefined {
   const id = (telegramId ?? "").toString().trim();
@@ -915,6 +1084,12 @@ export function dbSetSkillsRegistry(skills: Array<{ id: string; name: string; de
 // --- Skills access ---
 export function dbGetSkillsAccessDefault(): string[] {
   const database = getDb();
+  const cols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
+  const hasSkillId = cols.some((c) => c.name === "skill_id");
+  if (hasSkillId) {
+    const rows = database.query("SELECT skill_id FROM skills_access_default ORDER BY skill_id").all() as { skill_id: string }[];
+    return rows.map((r) => r.skill_id).filter(Boolean);
+  }
   const row = database.query("SELECT allowed FROM skills_access_default WHERE id = 1").get() as { allowed: string } | undefined;
   if (!row) return [];
   try {
@@ -927,6 +1102,34 @@ export function dbGetSkillsAccessDefault(): string[] {
 
 export function dbGetSkillsAccessByNumber(): Record<string, string[]> {
   const database = getDb();
+  const defaultList = dbGetSkillsAccessDefault();
+  const defaultSet = new Set(defaultList);
+  const cols = database.query("PRAGMA table_info(skills_access_by_user)").all() as { name: string }[];
+  const hasSkillId = cols.some((c) => c.name === "skill_id");
+  if (hasSkillId) {
+    const rows = database.query(`
+      SELECT u.id AS user_id, u.phone_number, u.telegram_id, s.skill_id FROM skills_access_by_user s
+      JOIN users u ON s.user_id = u.id
+    `).all() as { user_id: number; phone_number: string; telegram_id: string | null; skill_id: string }[];
+    const byUserId = new Map<number, Set<string>>();
+    const userToIdentifiers = new Map<number, { phone: string; telegramId: string | null }>();
+    for (const r of rows) {
+      const uid = r.user_id;
+      if (!userToIdentifiers.has(uid)) {
+        userToIdentifiers.set(uid, { phone: canonicalPhone(r.phone_number), telegramId: r.telegram_id?.trim() || null });
+      }
+      if (!byUserId.has(uid)) byUserId.set(uid, new Set());
+      byUserId.get(uid)!.add(r.skill_id);
+    }
+    const out: Record<string, string[]> = {};
+    for (const [uid, extraSet] of byUserId) {
+      const allowed = [...defaultList, ...extraSet].filter((x, i, a) => a.indexOf(x) === i);
+      const ids = userToIdentifiers.get(uid);
+      if (ids?.phone) out[ids.phone] = allowed;
+      if (ids?.telegramId) out["telegram:" + ids.telegramId] = allowed;
+    }
+    return out;
+  }
   const rows = database.query(`
     SELECT u.phone_number, u.telegram_id, s.allowed FROM skills_access_by_user s
     JOIN users u ON s.user_id = u.id
@@ -950,6 +1153,34 @@ export function dbGetSkillsAccessByNumber(): Record<string, string[]> {
 
 export function dbSetSkillsAccess(defaultAllowed: string[], byNumber: Record<string, string[]>): void {
   const database = getDb();
+  const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
+  const hasSkillId = defaultCols.some((c) => c.name === "skill_id");
+  const defaultSet = new Set(defaultAllowed);
+
+  if (hasSkillId) {
+    database.run("DELETE FROM skills_access_default");
+    const stmtDefault = database.prepare("INSERT INTO skills_access_default (skill_id) VALUES (?)");
+    for (const skillId of defaultAllowed) {
+      if (skillId?.trim()) stmtDefault.run(skillId.trim());
+    }
+    database.run("DELETE FROM skills_access_by_user");
+    for (const [num, allowed] of Object.entries(byNumber)) {
+      if (!Array.isArray(allowed)) continue;
+      const canonical = canonicalPhone(num);
+      if (canonical.length < 10) continue;
+      let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
+      if (!userRow) {
+        database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
+        userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
+      }
+      const extra = allowed.filter((s) => typeof s === "string" && s.trim() && !defaultSet.has(s.trim()));
+      const stmtUser = database.prepare("INSERT INTO skills_access_by_user (user_id, skill_id) VALUES (?, ?)");
+      for (const skillId of extra) {
+        if (skillId?.trim()) stmtUser.run(userRow.id, skillId.trim());
+      }
+    }
+    return;
+  }
   database.run("DELETE FROM skills_access_default");
   database.run("INSERT INTO skills_access_default (id, allowed) VALUES (1, ?)", [JSON.stringify(defaultAllowed)]);
   database.run("DELETE FROM skills_access_by_user");
@@ -1189,4 +1420,228 @@ export function dbUpdateTodoDue(owner: string, id: number, due: string): boolean
   if (userId == null) return false;
   const result = database.run("UPDATE todos SET due = ? WHERE user_id = ? AND id = ?", [due, userId, id]);
   return (result as { changes: number }).changes > 0;
+}
+
+// --- Schedule state (scheduler idempotency) ---
+export type ScheduleStateRow = {
+  user_id: number;
+  last_convo_end_utc: string | null;
+  last_daily_starter_date: string | null;
+  last_4h_nudge_date: string | null;
+  last_overdue_reminder_date: string | null;
+};
+
+export function dbGetScheduleState(userId: number): ScheduleStateRow | null {
+  const database = getDb();
+  const row = database
+    .query(
+      "SELECT user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date FROM schedule_state WHERE user_id = ?"
+    )
+    .get(userId) as ScheduleStateRow | undefined;
+  return row ?? null;
+}
+
+export function dbUpsertScheduleState(
+  userId: number,
+  updates: Partial<Pick<ScheduleStateRow, "last_convo_end_utc" | "last_daily_starter_date" | "last_4h_nudge_date" | "last_overdue_reminder_date">>
+): void {
+  const database = getDb();
+  const existing = dbGetScheduleState(userId);
+  if (!existing) {
+    database.run(
+      "INSERT INTO schedule_state (user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date) VALUES (?, ?, ?, ?, ?)",
+      [
+        userId,
+        updates.last_convo_end_utc ?? null,
+        updates.last_daily_starter_date ?? null,
+        updates.last_4h_nudge_date ?? null,
+        updates.last_overdue_reminder_date ?? null,
+      ]
+    );
+    return;
+  }
+  const setParts: string[] = [];
+  const values: unknown[] = [];
+  if (updates.last_convo_end_utc !== undefined) {
+    setParts.push("last_convo_end_utc = ?");
+    values.push(updates.last_convo_end_utc);
+  }
+  if (updates.last_daily_starter_date !== undefined) {
+    setParts.push("last_daily_starter_date = ?");
+    values.push(updates.last_daily_starter_date);
+  }
+  if (updates.last_4h_nudge_date !== undefined) {
+    setParts.push("last_4h_nudge_date = ?");
+    values.push(updates.last_4h_nudge_date);
+  }
+  if (updates.last_overdue_reminder_date !== undefined) {
+    setParts.push("last_overdue_reminder_date = ?");
+    values.push(updates.last_overdue_reminder_date);
+  }
+  if (setParts.length === 0) return;
+  values.push(userId);
+  database.run(`UPDATE schedule_state SET ${setParts.join(", ")} WHERE user_id = ?`, ...values);
+}
+
+/** Update last_convo_end_utc for a user (call when reply is sent to user or they send a message). */
+export function dbUpdateLastConvoEndUtc(userId: number): void {
+  dbUpsertScheduleState(userId, { last_convo_end_utc: new Date().toISOString() });
+}
+
+/** Get IANA timezone for user; fallback to BO_DEFAULT_TZ config or env. */
+export function dbGetUserTimezone(userId: number): string {
+  const database = getDb();
+  const row = database.query("SELECT timezone_iana FROM users WHERE id = ?").get(userId) as { timezone_iana: string | null } | undefined;
+  const tz = row?.timezone_iana?.trim();
+  if (tz) return tz;
+  const configTz = dbGetConfig("default_tz")?.trim() || dbGetConfig("BO_DEFAULT_TZ")?.trim();
+  if (configTz) return configTz;
+  return process.env.BO_DEFAULT_TZ?.trim() || "America/New_York";
+}
+
+// --- Reminders (one-off and recurring; creator + recipient) ---
+export type ReminderRow = {
+  id: number;
+  creator_user_id: number;
+  recipient_user_id: number;
+  text: string;
+  kind: "one_off" | "recurring";
+  fire_at_utc: string | null;
+  recurrence: string | null;
+  next_fire_at_utc: string | null;
+  created_at: string;
+  sent_at: string | null;
+  last_fired_at: string | null;
+};
+
+export function dbAddReminder(
+  creatorUserId: number,
+  recipientUserId: number,
+  text: string,
+  kind: "one_off" | "recurring",
+  fireAtUtc: string | null,
+  recurrence: string | null,
+  nextFireAtUtc: string | null
+): number {
+  const database = getDb();
+  const now = new Date().toISOString();
+  const result = database.run(
+    "INSERT INTO reminders (creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    [creatorUserId, recipientUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc, now, null, null]
+  ) as { lastInsertRowid: number };
+  return result.lastInsertRowid;
+}
+
+export function dbGetRemindersForRecipient(recipientUserId: number): ReminderRow[] {
+  const database = getDb();
+  return database
+    .query(
+      "SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders WHERE recipient_user_id = ? ORDER BY id ASC"
+    )
+    .all(recipientUserId) as ReminderRow[];
+}
+
+export function dbGetRemindersByCreator(creatorUserId: number): ReminderRow[] {
+  const database = getDb();
+  return database
+    .query(
+      "SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders WHERE creator_user_id = ? ORDER BY id ASC"
+    )
+    .all(creatorUserId) as ReminderRow[];
+}
+
+/** Reminders where recipient is userId or created by userId. */
+export function dbGetRemindersForUser(userId: number, filter?: "for_me" | "by_me"): ReminderRow[] {
+  if (filter === "by_me") return dbGetRemindersByCreator(userId);
+  if (filter === "for_me") return dbGetRemindersForRecipient(userId);
+  const byCreator = dbGetRemindersByCreator(userId);
+  const forRecipient = dbGetRemindersForRecipient(userId);
+  const seen = new Set<number>();
+  const out: ReminderRow[] = [];
+  for (const r of forRecipient) {
+    if (!seen.has(r.id)) {
+      seen.add(r.id);
+      out.push(r);
+    }
+  }
+  for (const r of byCreator) {
+    if (!seen.has(r.id)) {
+      seen.add(r.id);
+      out.push(r);
+    }
+  }
+  out.sort((a, b) => a.id - b.id);
+  return out;
+}
+
+export function dbGetReminderById(id: number): ReminderRow | null {
+  const database = getDb();
+  const row = database
+    .query(
+      "SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders WHERE id = ?"
+    )
+    .get(id) as ReminderRow | undefined;
+  return row ?? null;
+}
+
+/** One-off: fire_at_utc <= now and sent_at IS NULL. Recurring: next_fire_at_utc <= now. */
+export function dbGetDueReminders(nowIso: string): ReminderRow[] {
+  const database = getDb();
+  const rows = database
+    .query(
+      `SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders
+       WHERE (kind = 'one_off' AND fire_at_utc <= ? AND sent_at IS NULL) OR (kind = 'recurring' AND next_fire_at_utc IS NOT NULL AND next_fire_at_utc <= ?)
+       ORDER BY id ASC`
+    )
+    .all(nowIso, nowIso) as ReminderRow[];
+  return rows;
+}
+
+export function dbMarkReminderSentOneOff(id: number): void {
+  const database = getDb();
+  const now = new Date().toISOString();
+  database.run("UPDATE reminders SET sent_at = ? WHERE id = ? AND kind = 'one_off'", [now, id]);
+}
+
+export function dbAdvanceRecurringReminder(id: number, nextFireAtUtc: string): void {
+  const database = getDb();
+  const now = new Date().toISOString();
+  database.run("UPDATE reminders SET next_fire_at_utc = ?, last_fired_at = ? WHERE id = ? AND kind = 'recurring'", [nextFireAtUtc, now, id]);
+}
+
+export function dbUpdateReminder(id: number, updates: Partial<Pick<ReminderRow, "text" | "fire_at_utc" | "recurrence" | "next_fire_at_utc">>): boolean {
+  const database = getDb();
+  const setParts: string[] = [];
+  const values: unknown[] = [];
+  if (updates.text !== undefined) {
+    setParts.push("text = ?");
+    values.push(updates.text);
+  }
+  if (updates.fire_at_utc !== undefined) {
+    setParts.push("fire_at_utc = ?");
+    values.push(updates.fire_at_utc);
+  }
+  if (updates.recurrence !== undefined) {
+    setParts.push("recurrence = ?");
+    values.push(updates.recurrence);
+  }
+  if (updates.next_fire_at_utc !== undefined) {
+    setParts.push("next_fire_at_utc = ?");
+    values.push(updates.next_fire_at_utc);
+  }
+  if (setParts.length === 0) return false;
+  values.push(id);
+  const result = database.run(`UPDATE reminders SET ${setParts.join(", ")} WHERE id = ?`, ...values) as { changes: number };
+  return result.changes > 0;
+}
+
+export function dbDeleteReminder(id: number): boolean {
+  const database = getDb();
+  const result = database.run("DELETE FROM reminders WHERE id = ?", [id]) as { changes: number };
+  return result.changes > 0;
+}
+
+/** Check if user can modify reminder: creator or recipient. */
+export function dbCanUserModifyReminder(userId: number, reminder: ReminderRow): boolean {
+  return reminder.creator_user_id === userId || reminder.recipient_user_id === userId;
 }

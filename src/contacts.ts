@@ -1,6 +1,6 @@
 import { dbGetContactsList, dbGetContactsNameToNumber, dbGetContactsNumberToName } from "./db";
 
-/** Load contacts from DB (migrated from config/contacts.json). Returns number → name for display (proper casing). */
+/** Load contacts from DB (users table). Returns number → name for display (proper casing). */
 export function getNumberToName(): Map<string, string> {
   return dbGetContactsNumberToName();
 }
@@ -10,7 +10,7 @@ export function getContactsList(): Array<{ name: string; number: string }> {
   return dbGetContactsList();
 }
 
-/** Load contacts from DB (migrated from config/contacts.json). Returns name (lowercase) → canonical 10-digit number for send_to_contact. */
+/** Load contacts from DB (users table). Returns name (lowercase) → canonical 10-digit number for send_to_contact. */
 export function getNameToNumber(): Map<string, string> {
   return dbGetContactsNameToNumber();
 }
