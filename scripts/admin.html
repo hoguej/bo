@@ -124,6 +124,14 @@
     const API = "";
     function escapeHtml(s) { const d = document.createElement("div"); d.textContent = s ?? ""; return d.innerHTML; }
 
+    function prettifyForDisplay(s) {
+      if (!s) return "";
+      return String(s)
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "\t")
+        .replace(/\\r/g, "\r");
+    }
+
     async function api(method, path, body) {
       const opt = { method, headers: body ? { "Content-Type": "application/json" } : {} };
       if (body) opt.body = JSON.stringify(body);
@@ -250,9 +258,11 @@
             const val = row[col];
             const fk = fkForColumn(col);
             let display = val === null || val === undefined ? "" : String(val);
-            const isLongText = selectedTable === "llm_log" && (col === "request_doc" || col === "response_text");
-            if (isLongText && display.length > 80) {
-              const truncated = display.slice(0, 80) + "…";
+            const colLower = (col || "").toLowerCase();
+            const tableLower = (selectedTable || "").toLowerCase();
+            const isLongText = tableLower === "llm_log" && (colLower === "request_doc" || colLower === "response_text");
+            if (isLongText) {
+              const truncated = display.length > 80 ? display.slice(0, 80) + "…" : display;
               return `<td class="text-cell" data-row-index="${rowIndex}" data-column="${escapeHtml(col)}" title="Click to view full content">${escapeHtml(truncated)}</td>`;
             }
             if (fk && fk.table === "users" && (display !== "" || val === 0)) {
@@ -262,9 +272,6 @@
             if (fk && (display !== "" || val === 0)) {
               const rawVal = val === null || val === undefined ? "" : String(val);
               return `<td class="fk" data-fk-table="${escapeHtml(fk.table)}" data-fk-column="${escapeHtml(fk.to)}" data-fk-value="${escapeHtml(rawVal)}" title="View ${escapeHtml(fk.table)}.${escapeHtml(fk.to)} = ${escapeHtml(rawVal)}">${escapeHtml(display)}</td>`;
-            }
-            if (isLongText && display.length > 0) {
-              return `<td class="text-cell" data-row-index="${rowIndex}" data-column="${escapeHtml(col)}" title="Click to view full content">${escapeHtml(display)}</td>`;
             }
             return `<td>${escapeHtml(display)}</td>`;
           });
@@ -281,14 +288,19 @@
           });
         });
         tbody.querySelectorAll("td.text-cell").forEach(td => {
-          td.addEventListener("click", () => {
+          td.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!lastResult || !lastResult.rows) return;
             const rowIndex = parseInt(td.dataset.rowIndex, 10);
-            const col = td.dataset.column;
+            if (Number.isNaN(rowIndex) || rowIndex < 0 || rowIndex >= lastResult.rows.length) return;
+            const col = td.getAttribute("data-column");
             const row = lastResult.rows[rowIndex];
             if (!row || col == null) return;
-            let full = row[col];
+            const colKey = Object.keys(row).find((k) => k.toLowerCase() === col.toLowerCase()) || col;
+            let full = row[colKey];
             full = full === null || full === undefined ? "" : String(full);
-            if (col === "request_doc" && full) {
+            if (colKey.toLowerCase() === "request_doc" && full) {
               try {
                 const parsed = JSON.parse(full);
                 full = JSON.stringify(parsed, null, 2);

@@ -19,7 +19,9 @@ Only include **true attributes** about the user or their context:
 - Stated: name, family members' names, ages, location, preferences, work, pets.
 - Inferred: e.g. "Cara is Carrie's daughter", "Cara is female".
 
-Do **NOT** include: meeting titles, meeting subjects, todo text, one-off requests, or requested actions.
+Do **NOT** include:
+- Meeting titles, meeting subjects, todo text, one-off requests, or requested actions.
+- **User-record / system data** — these are held elsewhere (users table), not in facts: `can_trigger_agent`, `telegram_id`, `phone_number`, `first_name`, `last_name`. Never save these as facts.
 
 If nothing to save, return an empty array: `[]`
 

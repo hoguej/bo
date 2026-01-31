@@ -21,7 +21,7 @@ import {
   upsertFact,
 } from "../src/memory";
 import { getContactsList, getNameToNumber, getNumberToName, resolveContactToNumber } from "../src/contacts";
-import { dbGetConfig, dbGetTelegramIdByPhone, dbInsertLlmLog } from "../src/db";
+import { dbGetConfig, dbGetTelegramIdByPhone, dbInsertLlmLog, isReservedFactKey } from "../src/db";
 import {
   getAllowedSkillIdsForOwner,
   getSkillById,
@@ -456,6 +456,7 @@ async function main() {
     if (Array.isArray(toSaveFacts)) {
       for (const f of toSaveFacts) {
         if (f && typeof f.key === "string" && typeof f.value === "string") {
+          if (isReservedFactKey(f.key)) continue;
           if (String(f.key).toLowerCase() === "personality_instruction") {
             appendPersonalityInstruction(owner, f.value);
           } else {

@@ -130,6 +130,7 @@ function initSchema(database: import("bun:sqlite").Database): void {
   database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
   migrateLlmLogAddOwner(database);
+  migrateFactsRemoveSystemKeys(database);
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_request_id ON llm_log(request_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_owner ON llm_log(owner)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_created_at ON llm_log(created_at)");
@@ -924,6 +925,26 @@ export function dbSetSkillsAccess(defaultAllowed: string[], byNumber: Record<str
 }
 
 // --- Facts ---
+/** Keys that belong in users/config, not in facts. Never save these as facts; migration removes any that exist. */
+export const FACTS_RESERVED_KEYS = [
+  "can_trigger_agent",
+  "telegram_id",
+  "phone_number",
+  "first_name",
+  "last_name",
+] as const;
+
+export function isReservedFactKey(key: string): boolean {
+  const k = key.trim().toLowerCase();
+  return (FACTS_RESERVED_KEYS as readonly string[]).some((r) => r.toLowerCase() === k);
+}
+
+/** One-time: remove facts that are user-record/system data (can_trigger_agent, telegram_id, etc.). */
+function migrateFactsRemoveSystemKeys(database: import("bun:sqlite").Database): void {
+  const placeholders = FACTS_RESERVED_KEYS.map(() => "?").join(",");
+  database.run(`DELETE FROM facts WHERE LOWER(TRIM(key)) IN (${placeholders})`, FACTS_RESERVED_KEYS.map((s) => s.toLowerCase()));
+}
+
 export function dbGetFacts(owner: string): Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }> {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
@@ -932,6 +953,7 @@ export function dbGetFacts(owner: string): Array<{ key: string; value: string; s
 }
 
 export function dbUpsertFact(owner: string, key: string, value: string, scope: string, tags: string[]): void {
+  if (isReservedFactKey(key)) return;
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
   if (userId == null) return;
