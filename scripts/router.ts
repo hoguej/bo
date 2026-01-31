@@ -414,7 +414,7 @@ async function main() {
         if (skill) {
           const input: Record<string, unknown> = day ? { day } : {};
           logErr(`short-circuit send_to_contact: ${contactDisplay}, weather${day ? ` ${day}` : ""}`);
-          const { stdout, stderr, code } = await callSkill(skill.entrypoint, input, { BO_REQUEST_ID: requestId });
+          const { stdout, stderr, code } = await callSkill(skill.entrypoint, input, { BO_REQUEST_ID: requestId, BO_REQUEST_FROM: fromRaw ?? owner });
           if (stderr?.trim()) logErr(`skill stderr: ${stderr.trim().slice(0, 300)}`);
           if (code === 0 && stdout?.trim()) {
             const sendBody = stdout.trim().length > 2000 ? stdout.trim().slice(0, 1997) + "..." : stdout.trim();
@@ -577,7 +577,8 @@ async function main() {
     const input = decisionToSkillInput(decision);
     logErr(`next: run skill ${skill.id} (${skill.entrypoint})`);
     if (debug) logBlockReq("skill input", JSON.stringify(input, null, 2));
-    const { stdout, stderr, code } = await callSkill(skill.entrypoint, input, { BO_REQUEST_ID: requestId });
+    const skillEnv = { BO_REQUEST_ID: requestId, BO_REQUEST_FROM: fromRaw ?? owner };
+    const { stdout, stderr, code } = await callSkill(skill.entrypoint, input, skillEnv);
     if (stderr?.trim()) logErr(`skill stderr: ${stderr.trim().slice(0, 1000)}${stderr.length > 1000 ? "…" : ""}`);
     if (code !== 0) {
       logErr(`Skill failed exitCode=${code} skill=${skill.id} stderr=${(stderr || "(none)").slice(0, 500)}`);

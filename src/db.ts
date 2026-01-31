@@ -93,6 +93,7 @@ function initSchema(database: import("bun:sqlite").Database): void {
     CREATE TABLE IF NOT EXISTS todos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      creator_user_id INTEGER REFERENCES users(id),
       text TEXT NOT NULL,
       done INTEGER NOT NULL DEFAULT 0,
       due TEXT,
@@ -130,6 +131,7 @@ function initSchema(database: import("bun:sqlite").Database): void {
   database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
   migrateLlmLogAddOwner(database);
+  migrateTodosAddCreator(database);
   migrateFactsRemoveSystemKeys(database);
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_request_id ON llm_log(request_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_owner ON llm_log(owner)");
@@ -194,6 +196,17 @@ function migrateUsersAddCanTriggerAgent(database: import("bun:sqlite").Database)
 }
 
 /** One-time: add telegram_id to users (allowlist for Telegram; link to existing user). */
+/** One-time: add creator_user_id to todos (who created the todo; assignee is user_id). */
+function migrateTodosAddCreator(database: import("bun:sqlite").Database): void {
+  try {
+    const info = database.query("PRAGMA table_info(todos)").all() as { name: string }[];
+    if (info.some((c) => c.name === "creator_user_id")) return;
+    database.run("ALTER TABLE todos ADD COLUMN creator_user_id INTEGER REFERENCES users(id)");
+  } catch (_) {
+    /* table may not exist yet */
+  }
+}
+
 /** One-time: add owner column to llm_log so we can trace every request/response to request_id and user. */
 function migrateLlmLogAddOwner(database: import("bun:sqlite").Database): void {
   try {
@@ -646,6 +659,13 @@ export function dbGetUsersByIds(ids: number[]): Array<{ id: number; first_name: 
   return database.query(`SELECT id, first_name, last_name FROM users WHERE id IN (${placeholders})`).all(...ids) as Array<{ id: number; first_name: string; last_name: string }>;
 }
 
+/** Get one user by id (for todo creator display name). Returns null if not found. */
+export function dbGetUserById(id: number): { id: number; first_name: string; last_name: string; phone_number: string } | null {
+  const database = getDb();
+  const row = database.query("SELECT id, first_name, last_name, phone_number FROM users WHERE id = ?").get(id) as { id: number; first_name: string; last_name: string; phone_number: string } | undefined;
+  return row ?? null;
+}
+
 /** Primary key column names for a table (ordered by pk). */
 export function dbGetPkColumns(tableName: string): string[] {
   const cols = dbGetTableInfo(tableName);
@@ -1080,19 +1100,41 @@ export function dbGetPersonality(owner: string): string {
 }
 
 // --- Todos ---
-export function dbGetTodos(owner: string): Array<{ id: number; text: string; done: number; due: string | null; createdAt: string }> {
+export type TodoRow = { id: number; text: string; done: number; due: string | null; createdAt: string; creator_user_id: number | null };
+
+export function dbGetTodos(owner: string, opts?: { includeDone?: boolean }): TodoRow[] {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
   if (userId == null) return [];
-  return database.query("SELECT id, text, done, due, created_at AS createdAt FROM todos WHERE user_id = ? ORDER BY id").all(userId) as Array<{ id: number; text: string; done: number; due: string | null; createdAt: string }>;
+  const includeDone = opts?.includeDone === true;
+  const where = includeDone ? "user_id = ?" : "user_id = ? AND done = 0";
+  return database.query(
+    `SELECT id, text, done, due, created_at AS createdAt, creator_user_id FROM todos WHERE ${where} ORDER BY id ASC`
+  ).all(userId) as TodoRow[];
 }
 
-export function dbAddTodo(owner: string, text: string, due: string | null): void {
+/** Add a todo. Returns the new todo id, or undefined if owner could not be resolved. */
+export function dbAddTodo(owner: string, text: string, due: string | null, creatorOwner?: string): number | undefined {
   const database = getDb();
   const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return;
+  if (userId == null) return undefined;
+  const creatorUserId = creatorOwner != null ? resolveOwnerToUserId(database, creatorOwner) : userId;
   const now = new Date().toISOString();
-  database.run("INSERT INTO todos (user_id, text, done, due, created_at) VALUES (?, ?, 0, ?, ?)", [userId, text, due, now]);
+  const result = database.run(
+    "INSERT INTO todos (user_id, creator_user_id, text, done, due, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+    [userId, creatorUserId ?? userId, text, due, now]
+  ) as { lastInsertRowid?: number };
+  return result.lastInsertRowid ?? undefined;
+}
+
+export function dbGetTodoById(owner: string, id: number): TodoRow | null {
+  const database = getDb();
+  const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return null;
+  const row = database.query(
+    "SELECT id, text, done, due, created_at AS createdAt, creator_user_id FROM todos WHERE user_id = ? AND id = ?"
+  ).get(userId, id) as TodoRow | undefined;
+  return row ?? null;
 }
 
 export function dbUpdateTodoDone(owner: string, id: number): boolean {

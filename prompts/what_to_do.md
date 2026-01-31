@@ -29,8 +29,20 @@ No parameters. The user message is the input to create_a_response.
 - `day` (optional): e.g. "tomorrow", "today", day name.
 
 ### todo
-- `action`: "list" | "add" | "mark_done" | "remove" | "edit" | "set_due".
-- `text`, `number`, `due`, `for_contact` as needed.
+- `action`: "list" | "add" | "add_many" | "mark_done" | "remove" | "edit" | "set_due".
+- **add**: `text` (string). You may fix grammar/spelling, add emotes, extrapolate. `due`, `for_contact` as needed.
+- **add_many**: Use when the user provides **a list** of tasks (e.g. "add these: buy milk, call mom, wash the car" or bullet/numbered list). `items` (array of `{ text: string, due?: string }`). Each item is one todo; you may fix grammar/spelling per item. `for_contact` as needed.
+- `text` (for edit): Match what the user says more closely. When reading back a todo, use the **verbatim** stored text.
+- `number` (optional for own list): Task **id** (from the list). When acting on **someone else's list** (`for_contact` set), **number is required** — e.g. "mark Carrie's task #4 as done" not "Carrie did a good job on the car".
+- `match_phrase` (optional, own list only): Approximate language to pick a task when the user doesn't give an id. E.g. "everybody is fed" → match task like "Feed the dog"; "wash the truck" → match "Wash the truck".
+- `show_done` (optional, for list): If true, include completed tasks in the list. **By default, list shows only open tasks.**
+- `due`, `for_contact` as needed.
+
+**When to choose todo:**
+- Single task: "I need to …", "add a task", "remind me to …" → **add** with `text`.
+- **List of tasks**: "add these: X, Y, Z", "add to my list: …", bullet or numbered list of items → **add_many** with `items: [{ text: "…" }, …]`.
+- Language like "done", "finished", "everybody is fed", "I did the car" (on own list) → **mark_done** (use `match_phrase` or `number`).
+- For **other people's lists**: require explicit wording like "mark Carrie's task #4 as done" — do not infer from "Carrie did a good job".
 
 ### brave, google
 - `query` (string): User's request or search query.
@@ -54,6 +66,10 @@ No parameters. The user message is the input to create_a_response.
 
 ```json
 { "skill": "todo", "action": "list" }
+```
+
+```json
+{ "skill": "todo", "action": "add_many", "items": [{ "text": "Buy milk" }, { "text": "Call Mom" }, { "text": "Wash the car" }] }
 ```
 
 ```json

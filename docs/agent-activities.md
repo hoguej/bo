@@ -109,6 +109,8 @@ Execute the chosen skill (script or inline LLM) with the given params. Each skil
 
 Skills include: **create_a_response**, **send_to_contact**, **weather**, **brave**, **todo**, **change_personality**, etc.
 
+**Todo skill** (`prompts/skills/todo.md`): List shows task **id** (ascending), **verbatim** text, creator, due date if any. By default list shows only **open** tasks; use `show_done: true` when the user asks for completed tasks. **add_many**: when the user provides a list of tasks (e.g. "add these: buy milk, call mom, wash the car"), use action `add_many` with `items: [{ text }, …]` to add them in one go. On the **user's own list**, approximate language is allowed: e.g. "everybody is fed" → mark_done with `match_phrase` matching "Feed the dog". On **another person's list** (`for_contact`), the user must be explicit (e.g. "mark Carrie's task #4 as done"); do not infer from vague praise. Creator is tracked by user id (can differ from assignee). Output: `{ response, hints?: { todo_ids } }`.
+
 ---
 
 ## 4. Send to contact (skill)
