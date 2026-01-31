@@ -9,6 +9,7 @@ import {
   dbGetFacts,
   dbGetPersonality,
   dbGetSummary,
+  dbSetSummary,
   dbUpsertFact,
 } from "./db";
 import { canonicalPhone } from "./phone";
@@ -85,6 +86,11 @@ export function appendSummarySentence(owner: string | undefined, sentence: strin
 /** Get the running summary for prompt context (oldest first). */
 export function getSummaryForPrompt(owner: string | undefined): string {
   return dbGetSummary(normalizeOwner(owner));
+}
+
+/** Replace the full summary with a single string (used by prompt-driven summary step). */
+export function setSummaryForPrompt(owner: string | undefined, fullSummary: string): void {
+  dbSetSummary(normalizeOwner(owner), fullSummary.trim());
 }
 
 /** Path for per-user personality instructions. personality_<owner>.json. */

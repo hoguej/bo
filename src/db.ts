@@ -108,6 +108,16 @@ function initSchema(database: import("bun:sqlite").Database): void {
       key TEXT NOT NULL PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS llm_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      request_id TEXT NOT NULL,
+      owner TEXT NOT NULL,
+      step TEXT NOT NULL,
+      request_doc TEXT,
+      response_text TEXT,
+      created_at TEXT NOT NULL
+    );
   `);
   migrateOldTablesToUsers(database);
   migrateOwnerColumnsToUserId(database);
@@ -119,6 +129,10 @@ function initSchema(database: import("bun:sqlite").Database): void {
   database.run("CREATE INDEX IF NOT EXISTS idx_conversation_user_seq ON conversation(user_id, seq)");
   database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
+  migrateLlmLogAddOwner(database);
+  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_request_id ON llm_log(request_id)");
+  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_owner ON llm_log(owner)");
+  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_created_at ON llm_log(created_at)");
   normalizeUserPhoneNumbers(database);
   seedConfigFromEnv(database);
 }
@@ -179,6 +193,17 @@ function migrateUsersAddCanTriggerAgent(database: import("bun:sqlite").Database)
 }
 
 /** One-time: add telegram_id to users (allowlist for Telegram; link to existing user). */
+/** One-time: add owner column to llm_log so we can trace every request/response to request_id and user. */
+function migrateLlmLogAddOwner(database: import("bun:sqlite").Database): void {
+  try {
+    const info = database.query("PRAGMA table_info(llm_log)").all() as { name: string }[];
+    if (info.some((c) => c.name === "owner")) return;
+    database.run("ALTER TABLE llm_log ADD COLUMN owner TEXT NOT NULL DEFAULT 'default'");
+  } catch (_) {
+    /* table may not exist yet */
+  }
+}
+
 function migrateUsersAddTelegramId(database: import("bun:sqlite").Database): void {
   const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
   if (cols.some((c) => c.name === "telegram_id")) return;
@@ -595,6 +620,23 @@ export function dbGetRowByColumn(tableName: string, column: string, value: unkno
   return row ?? null;
 }
 
+/** Insert one LLM prompt/response log row (request_id, owner, step, request_doc, response_text). Every request to the AI and every response is logged and traceable to request_id and user. */
+export function dbInsertLlmLog(
+  requestId: string,
+  owner: string,
+  step: string,
+  requestDoc: unknown,
+  responseText: string
+): void {
+  const database = getDb();
+  const created_at = new Date().toISOString();
+  const request_doc = typeof requestDoc === "string" ? requestDoc : JSON.stringify(requestDoc);
+  database.run(
+    "INSERT INTO llm_log (request_id, owner, step, request_doc, response_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [requestId, owner ?? "default", step, request_doc, responseText ?? "", created_at]
+  );
+}
+
 /** Get users by ids for admin UI (display "Name (id)" for user_id FKs). */
 export function dbGetUsersByIds(ids: number[]): Array<{ id: number; first_name: string; last_name: string }> {
   if (ids.length === 0) return [];
@@ -962,6 +1004,19 @@ export function dbGetSummary(owner: string): string {
   } catch {
     return "";
   }
+}
+
+/** Replace the full summary with a single string (used by prompt-driven summary step). Max 2000 chars. */
+export function dbSetSummary(owner: string, fullSummary: string): void {
+  const database = getDb();
+  const userId = resolveOwnerToUserId(database, owner);
+  if (userId == null) return;
+  const text = fullSummary.trim().slice(0, 2000);
+  database.run("INSERT INTO summary (user_id, sentences) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET sentences = ?", [
+    userId,
+    JSON.stringify([text]),
+    JSON.stringify([text]),
+  ]);
 }
 
 // --- Personality ---

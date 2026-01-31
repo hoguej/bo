@@ -49,6 +49,22 @@
     .modal .form-row label { display: inline-block; min-width: 120px; color: var(--muted); font-size: 12px; }
     .modal .form-row input, .modal .form-row textarea { width: 100%; max-width: 400px; }
     .modal-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
+    .data-table td.text-cell { color: var(--accent); cursor: pointer; text-decoration: underline; max-width: 200px; }
+    .data-table td.text-cell:hover { filter: brightness(1.2); }
+    .cell-content-modal .modal { max-width: 95vw; max-height: 90vh; padding: 1.25rem; }
+    .cell-content-modal pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 70vh;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.5;
+      margin: 0;
+      padding: 1rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+    }
   </style>
 </head>
 <body>
@@ -89,6 +105,16 @@
         <div class="modal-actions">
           <button class="primary" id="row-modal-save">Save</button>
           <button id="row-modal-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="cell-content-modal" class="modal-overlay cell-content-modal">
+      <div class="modal">
+        <h3 id="cell-content-title"></h3>
+        <pre id="cell-content-body"></pre>
+        <div class="modal-actions">
+          <button id="cell-content-close">Close</button>
         </div>
       </div>
     </div>
@@ -145,7 +171,9 @@
       document.getElementById("breadcrumb").innerHTML = `<strong>${escapeHtml(table)}</strong>`;
       document.getElementById("query-section").style.display = "block";
       document.getElementById("empty-state").style.display = "none";
-      lastQuery = `SELECT * FROM ${table}`;
+      lastQuery = table === "llm_log"
+        ? "SELECT * FROM llm_log ORDER BY created_at DESC LIMIT 200"
+        : `SELECT * FROM ${table}`;
       document.getElementById("query-editor").value = lastQuery;
 
       const j = await api("GET", "/api/db/schema/" + encodeURIComponent(table));
@@ -222,6 +250,11 @@
             const val = row[col];
             const fk = fkForColumn(col);
             let display = val === null || val === undefined ? "" : String(val);
+            const isLongText = selectedTable === "llm_log" && (col === "request_doc" || col === "response_text");
+            if (isLongText && display.length > 80) {
+              const truncated = display.slice(0, 80) + "…";
+              return `<td class="text-cell" data-row-index="${rowIndex}" data-column="${escapeHtml(col)}" title="Click to view full content">${escapeHtml(truncated)}</td>`;
+            }
             if (fk && fk.table === "users" && (display !== "" || val === 0)) {
               const name = userLabel[Number(val)] || "";
               display = name ? name + " (" + val + ")" : display;
@@ -229,6 +262,9 @@
             if (fk && (display !== "" || val === 0)) {
               const rawVal = val === null || val === undefined ? "" : String(val);
               return `<td class="fk" data-fk-table="${escapeHtml(fk.table)}" data-fk-column="${escapeHtml(fk.to)}" data-fk-value="${escapeHtml(rawVal)}" title="View ${escapeHtml(fk.table)}.${escapeHtml(fk.to)} = ${escapeHtml(rawVal)}">${escapeHtml(display)}</td>`;
+            }
+            if (isLongText && display.length > 0) {
+              return `<td class="text-cell" data-row-index="${rowIndex}" data-column="${escapeHtml(col)}" title="Click to view full content">${escapeHtml(display)}</td>`;
             }
             return `<td>${escapeHtml(display)}</td>`;
           });
@@ -242,6 +278,26 @@
             const column = td.dataset.fkColumn;
             const value = td.dataset.fkValue;
             loadRowDetail(table, column, value);
+          });
+        });
+        tbody.querySelectorAll("td.text-cell").forEach(td => {
+          td.addEventListener("click", () => {
+            const rowIndex = parseInt(td.dataset.rowIndex, 10);
+            const col = td.dataset.column;
+            const row = lastResult.rows[rowIndex];
+            if (!row || col == null) return;
+            let full = row[col];
+            full = full === null || full === undefined ? "" : String(full);
+            if (col === "request_doc" && full) {
+              try {
+                const parsed = JSON.parse(full);
+                full = JSON.stringify(parsed, null, 2);
+              } catch (_) {}
+            }
+            full = prettifyForDisplay(full || "");
+            document.getElementById("cell-content-title").textContent = col;
+            document.getElementById("cell-content-body").textContent = full || "(empty)";
+            document.getElementById("cell-content-modal").classList.add("visible");
           });
         });
         tbody.querySelectorAll("button[data-action=edit]").forEach(btn => {
@@ -348,6 +404,9 @@
     document.getElementById("row-modal-save").addEventListener("click", () => saveRowModal());
     document.getElementById("row-modal-cancel").addEventListener("click", () => closeRowModal());
     document.getElementById("row-modal").addEventListener("click", (e) => { if (e.target.id === "row-modal") closeRowModal(); });
+
+    document.getElementById("cell-content-close").addEventListener("click", () => document.getElementById("cell-content-modal").classList.remove("visible"));
+    document.getElementById("cell-content-modal").addEventListener("click", (e) => { if (e.target.id === "cell-content-modal") e.target.classList.remove("visible"); });
 
     document.getElementById("reset-query").addEventListener("click", () => {
       if (selectedTable) {
