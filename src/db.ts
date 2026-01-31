@@ -114,6 +114,7 @@ function initSchema(database: import("bun:sqlite").Database): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       request_id TEXT NOT NULL,
       owner TEXT NOT NULL,
+      user_id INTEGER REFERENCES users(id),
       step TEXT NOT NULL,
       request_doc TEXT,
       response_text TEXT,
@@ -131,10 +132,12 @@ function initSchema(database: import("bun:sqlite").Database): void {
   database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
   migrateLlmLogAddOwner(database);
+  migrateLlmLogAddUserId(database);
   migrateTodosAddCreator(database);
   migrateFactsRemoveSystemKeys(database);
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_request_id ON llm_log(request_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_owner ON llm_log(owner)");
+  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_user_id ON llm_log(user_id)");
   database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_created_at ON llm_log(created_at)");
   normalizeUserPhoneNumbers(database);
   seedConfigFromEnv(database);
@@ -213,6 +216,24 @@ function migrateLlmLogAddOwner(database: import("bun:sqlite").Database): void {
     const info = database.query("PRAGMA table_info(llm_log)").all() as { name: string }[];
     if (info.some((c) => c.name === "owner")) return;
     database.run("ALTER TABLE llm_log ADD COLUMN owner TEXT NOT NULL DEFAULT 'default'");
+  } catch (_) {
+    /* table may not exist yet */
+  }
+}
+
+/** One-time: add user_id to llm_log and backfill from owner (phone or telegram:<id>). */
+function migrateLlmLogAddUserId(database: import("bun:sqlite").Database): void {
+  try {
+    const info = database.query("PRAGMA table_info(llm_log)").all() as { name: string }[];
+    const hasUserId = info.some((c) => c.name === "user_id");
+    if (!hasUserId) database.run("ALTER TABLE llm_log ADD COLUMN user_id INTEGER REFERENCES users(id)");
+    // Backfill (idempotent): owner is normalized to either canonical phone, "default", or "telegram:<id>".
+    database.run(
+      "UPDATE llm_log SET user_id = (SELECT id FROM users WHERE telegram_id = substr(owner, 10)) WHERE user_id IS NULL AND owner LIKE 'telegram:%'"
+    );
+    database.run(
+      "UPDATE llm_log SET user_id = (SELECT id FROM users WHERE phone_number = owner) WHERE user_id IS NULL AND owner NOT LIKE 'telegram:%'"
+    );
   } catch (_) {
     /* table may not exist yet */
   }
@@ -645,9 +666,10 @@ export function dbInsertLlmLog(
   const database = getDb();
   const created_at = new Date().toISOString();
   const request_doc = typeof requestDoc === "string" ? requestDoc : JSON.stringify(requestDoc);
+  const user_id = resolveOwnerToUserId(database, owner ?? "default") ?? null;
   database.run(
-    "INSERT INTO llm_log (request_id, owner, step, request_doc, response_text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    [requestId, owner ?? "default", step, request_doc, responseText ?? "", created_at]
+    "INSERT INTO llm_log (request_id, owner, user_id, step, request_doc, response_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [requestId, owner ?? "default", user_id, step, request_doc, responseText ?? "", created_at]
   );
 }
 

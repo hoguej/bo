@@ -11,7 +11,7 @@ Choose **exactly one** skill and its parameters. There is no separate "respond" 
 ## Output
 
 Return a **single JSON object** with:
-- `skill` (string): The skill id (e.g. `create_a_response`, `send_to_contact`, `weather`, `todo`, `brave`, `google`, `change_personality`).
+- `skill` (string): The skill id (e.g. `friend_mode`, `create_a_response`, `send_to_contact`, `weather`, `todo`, `brave`, `google`, `change_personality`).
 - Plus any parameters required by that skill.
 
 Exactly one skill per response. Parameters must match the skill's schema.
@@ -23,6 +23,12 @@ Exactly one skill per response. Parameters must match the skill's schema.
 
 ### create_a_response
 No parameters. The user message is the input to create_a_response.
+
+### friend_mode
+Use when the user is **just talking** (not asking you to do anything) and wants conversation, support, or connection.
+
+- No required parameters.
+- Optional: `person` (string) if the user explicitly wants friend mode tailored to someone else (rare). Otherwise the system will tailor to the requestor automatically.
 
 ### weather
 - `location` (optional): ZIP or location.
@@ -39,10 +45,15 @@ No parameters. The user message is the input to create_a_response.
 - `due`, `for_contact` as needed.
 
 **When to choose todo:**
-- Single task: "I need to …", "add a task", "remind me to …" → **add** with `text`.
-- **List of tasks**: "add these: X, Y, Z", "add to my list: …", bullet or numbered list of items → **add_many** with `items: [{ text: "…" }, …]`.
+- Single task: "I need to …", "add a task", "remind me to …" → **add** with `text`. If the user says **add to [name]'s list** or **add task to [name]'s todo list**, set **for_contact** to that person's first name (e.g. "Robert", "Carrie") so the task goes on their list with the requestor as creator.
+- **List of tasks**: "add these: X, Y, Z", "add to my list: …", bullet or numbered list of items → **add_many** with `items: [{ text: "…" }, …]`. Use **for_contact** when adding to someone else's list.
 - Language like "done", "finished", "everybody is fed", "I did the car" (on own list) → **mark_done** (use `match_phrase` or `number`).
 - For **other people's lists**: require explicit wording like "mark Carrie's task #4 as done" — do not infer from "Carrie did a good job".
+
+**When to choose friend_mode:**
+- User is chatting / sharing feelings / telling a story / seeking reassurance without asking for actions.
+- Phrases like "I just wanted to talk", "rough day", "I feel...", "can I vent", "I don't know what to do" (if they want support, not task execution).
+  - If they explicitly ask for advice or a plan, you can still use friend_mode (offer options: vent vs perspective vs plan).
 
 ### brave, google
 - `query` (string): User's request or search query.
@@ -57,6 +68,10 @@ No parameters. The user message is the input to create_a_response.
 ```
 
 ```json
+{ "skill": "friend_mode" }
+```
+
+```json
 { "skill": "send_to_contact", "from": "Jon", "to": "Cara", "ai_prompt": "say hello and tell her today will be a good day" }
 ```
 
@@ -66,6 +81,10 @@ No parameters. The user message is the input to create_a_response.
 
 ```json
 { "skill": "todo", "action": "list" }
+```
+
+```json
+{ "skill": "todo", "action": "add", "text": "Help me with Cara's wall", "due": "tomorrow", "for_contact": "Robert" }
 ```
 
 ```json

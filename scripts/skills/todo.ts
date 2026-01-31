@@ -13,7 +13,7 @@ import {
   dbUpdateTodoDue,
   dbUpdateTodoText,
 } from "../../src/db";
-import { getNameToNumber, getNumberToName } from "../../src/contacts";
+import { getNumberToName, resolveContactToNumber } from "../../src/contacts";
 import { normalizeOwner } from "../../src/memory";
 
 type Todo = {
@@ -64,12 +64,11 @@ function loadTodos(owner: string, opts?: { includeDone?: boolean }): Todo[] {
 
 function resolveOwner(input: Input): { owner: string; displayName: string } {
   const fromRaw = process.env.BO_REQUEST_FROM ?? "";
-  const nameToNumber = getNameToNumber();
   const numberToName = getNumberToName();
 
+  // for_contact = assignee (whose list). Resolve by full name or first name (e.g. "Robert" → Robert Hogue's number).
   if (input.for_contact && input.for_contact.trim()) {
-    const key = input.for_contact.trim().toLowerCase();
-    const num = nameToNumber.get(key);
+    const num = resolveContactToNumber(input.for_contact.trim());
     if (num) {
       const displayName = numberToName.get(num) ?? input.for_contact.trim();
       return { owner: num, displayName };

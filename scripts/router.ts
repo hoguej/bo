@@ -21,7 +21,14 @@ import {
   upsertFact,
 } from "../src/memory";
 import { getContactsList, getNameToNumber, getNumberToName, resolveContactToNumber } from "../src/contacts";
-import { dbGetConfig, dbGetTelegramIdByPhone, dbInsertLlmLog, isReservedFactKey } from "../src/db";
+import {
+  dbGetConfig,
+  dbGetTelegramIdByPhone,
+  dbGetUserById,
+  dbGetUserIdByTelegramId,
+  dbInsertLlmLog,
+  isReservedFactKey,
+} from "../src/db";
 import {
   getAllowedSkillIdsForOwner,
   getSkillById,
@@ -318,7 +325,8 @@ async function createResponseStep(
   userMessage: string,
   skillOutput: string,
   hints: Record<string, unknown> | string,
-  memoryPath: string
+  memoryPath: string,
+  extraContext: Record<string, string> = {}
 ): Promise<string> {
   const systemContent = loadPrompt("create_response") || "You are Bo. Return a single reply string to the user. Be concise and friendly.";
   const personalityBlock = getPersonalityForPrompt(owner);
@@ -329,6 +337,9 @@ async function createResponseStep(
   const recentMessages = getRecentMessages(owner, maxMessages - 1);
   const conversationBlock = formatConversationForPrompt(recentMessages);
   const hintsStr = typeof hints === "string" ? hints : JSON.stringify(hints);
+  const extraBlocks = Object.entries(extraContext)
+    .map(([k, v]) => ({ k: k.trim(), v: (v ?? "").toString().trim() }))
+    .filter((x) => x.k && x.v);
   const userContent = [
     "user_message:",
     userMessage,
@@ -336,6 +347,7 @@ async function createResponseStep(
     "skill_output:",
     skillOutput || "(none)",
     hintsStr && hintsStr !== "{}" ? `\nhints: ${hintsStr}\n` : "",
+    ...extraBlocks.flatMap((b) => ["", `${b.k}:`, b.v]),
     "personality:", personalityBlock || "(none)",
     "facts:", factsBlock || "(none)",
     "conversation_summary:", summaryBlock || "(none)",
@@ -473,6 +485,13 @@ async function main() {
   const whatToDoPrompt = loadPrompt("what_to_do") || "Choose exactly one skill and its parameters. Return a single JSON object: { skill: string, ...params }. Use skill create_a_response for general chat. Use skill send_to_contact with from, to, ai_prompt when sending to a contact.";
   const syntheticSkills: Array<{ id: string; name: string; description: string; inputSchema: unknown }> = [];
   if (!allowedSkills.some((s) => s.id === "create_a_response")) syntheticSkills.push({ id: "create_a_response", name: "Reply to user", description: "General chat or reply", inputSchema: {} });
+  if (!allowedSkills.some((s) => s.id === "friend_mode"))
+    syntheticSkills.push({
+      id: "friend_mode",
+      name: "Friend mode",
+      description: "Have a supportive, friendly conversation (good listener). Use when the user is just talking, venting, sharing feelings, or wants connection—not asking for tasks.",
+      inputSchema: { person: "string (optional; tailor friend mode to a named person)" },
+    });
   if (!allowedSkills.some((s) => s.id === "send_to_contact")) syntheticSkills.push({ id: "send_to_contact", name: "Send to contact", description: "Send a message to a contact (from, to, ai_prompt)", inputSchema: { from: "string", to: "string", ai_prompt: "string" } });
   const skillsForPrompt = [...syntheticSkills, ...skillsSummary];
   const whatToDoUser = ["user_message:", userMessage, "skills:", JSON.stringify(skillsForPrompt), "context:", JSON.stringify(context), "contacts:", contactNames].join("\n");
@@ -497,7 +516,47 @@ async function main() {
 
   let finalReply: string;
 
-  if (decision.skill === "create_a_response") {
+  if (decision.skill === "friend_mode") {
+    function normalizeFriendKey(s: string): string | undefined {
+      const first = (s ?? "").trim().split(/\s+/)[0]?.toLowerCase();
+      if (!first) return undefined;
+      if (first === "cara" || first === "robert" || first === "carrie" || first === "jon") return first;
+      return undefined;
+    }
+    const explicitPerson = typeof (decision as Record<string, unknown>).person === "string" ? String((decision as Record<string, unknown>).person) : "";
+    let friendKey = normalizeFriendKey(explicitPerson);
+    if (!friendKey) {
+      // Default: tailor to the requestor (sender).
+      let firstName: string | undefined;
+      if (owner.startsWith("telegram:")) {
+        const uid = dbGetUserIdByTelegramId(owner.slice(9));
+        if (uid != null) {
+          const u = dbGetUserById(uid);
+          firstName = u?.first_name?.trim() || undefined;
+        }
+      } else {
+        const display = numberToName.get(owner);
+        firstName = display ? display.split(/\s+/)[0] : undefined;
+      }
+      friendKey = normalizeFriendKey(firstName || "");
+    }
+    const genericFriendPrompt = loadPrompt("friends/friend");
+    const personalFriendPrompt = friendKey ? loadPrompt(`friends/${friendKey}_friend`) : "";
+    finalReply = await createResponseStep(
+      openai,
+      model,
+      requestId,
+      owner,
+      userMessage,
+      "",
+      { mode: "friend_mode", person: friendKey ?? null },
+      memoryPath,
+      {
+        friend_mode_generic_prompt: genericFriendPrompt || "(none)",
+        friend_mode_person_prompt: personalFriendPrompt || "(none)",
+      }
+    );
+  } else if (decision.skill === "create_a_response") {
     finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, "", {}, memoryPath);
   } else if (decision.skill === "send_to_contact") {
     const from = String(decision.from ?? "").trim();
