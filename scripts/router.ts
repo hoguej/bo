@@ -123,7 +123,7 @@ function loadPrompt(relativePath: string): string {
 }
 
 /** Log every request to the AI and every response; traceable to request_id and owner (user). Writes to DB (llm_log) and to file (~/.bo/requests.log or BO_REQUEST_LOG). */
-async function logPromptResponse(
+async function await logPromptResponse(
   requestId: string,
   owner: string,
   step: string,
@@ -209,7 +209,7 @@ function randomExcuse(): string {
   return EXCUSES_ON_ERROR[Math.floor(Math.random() * EXCUSES_ON_ERROR.length)]!;
 }
 
-async function buildContext() {
+async function await buildContext() {
   return {
     channel: "imessage",
     from: getEnv("BO_REQUEST_FROM"),
@@ -321,7 +321,7 @@ async function callLlmWithPrompt(
   if (mock) {
     const value = step in mock.responses ? mock.responses[step] : mock.defaultResponse;
     const raw = typeof value === "string" ? value : value == null ? "" : JSON.stringify(value);
-    logPromptResponse(requestId, owner, step, requestDoc, raw);
+    await logPromptResponse(requestId, owner, step, requestDoc, raw);
     if (mock.recordPath) {
       try {
         const record = { step, request: requestDoc, response: raw, at: new Date().toISOString() };
@@ -339,7 +339,7 @@ async function callLlmWithPrompt(
     stream: false,
   });
   const raw = completion.choices[0]?.message?.content?.trim() ?? "";
-  logPromptResponse(requestId, owner, step, requestDoc, raw);
+  await logPromptResponse(requestId, owner, step, requestDoc, raw);
   return raw;
 }
 
@@ -441,7 +441,7 @@ async function main() {
     : {};
 
   const registry = await loadSkillsRegistry();
-  const context = buildContext();
+  const context = await buildContext();
 
   // Separate fact store per sender: self-chat = default; 7404749170 / 6143480678 = their own store.
   const isSelfChat = getEnv("BO_REQUEST_IS_SELF_CHAT") === "true";
@@ -477,7 +477,7 @@ async function main() {
       }
       const day = days.length ? [...new Set(days)].join(",") : undefined;
       if (isWeather && allowedSkillIds.includes("weather")) {
-        const skill = getSkillById("weather");
+        const skill = await getSkillById("weather");
         if (skill) {
           const input: Record<string, unknown> = day ? { day } : {};
           logErr(`short-circuit send_to_contact: ${contactDisplay}, weather${day ? ` ${day}` : ""}`);
@@ -646,7 +646,7 @@ async function main() {
     const numberToName = getNumberToName();
     if (owner.startsWith("telegram:")) {
       const tid = owner.slice(9).trim();
-      const uid = tid ? dbGetUserIdByTelegramId(tid) : undefined;
+      const uid = tid ? await dbGetUserIdByTelegramId(tid) : undefined;
       if (uid != null) {
         const u = await dbGetUserById(uid);
         const first = (u?.first_name ?? "").trim();
@@ -737,7 +737,7 @@ async function main() {
     }
 
     // Run the skill to validate and get group info
-    const skill = getSkillById("send_to_group");
+    const skill = await getSkillById("send_to_group");
     if (!skill) {
       logErr("send_to_group skill not found");
       process.stdout.write("Group messaging is not available.");
@@ -803,7 +803,7 @@ async function main() {
     return;
   } else {
     const skillId = decision.skill;
-    const skill = getSkillById(skillId);
+    const skill = await getSkillById(skillId);
     if (!skill) {
       logErr(`Unknown skill_id: ${skillId}`);
       process.stdout.write(randomExcuse());
@@ -856,7 +856,7 @@ async function main() {
         let senderName: string;
         if (owner.startsWith("telegram:")) {
           const tid = owner.slice(9).trim();
-          const uid = tid ? dbGetUserIdByTelegramId(tid) : undefined;
+          const uid = tid ? await dbGetUserIdByTelegramId(tid) : undefined;
           if (uid != null) {
             const u = await dbGetUserById(uid);
             const first = (u?.first_name ?? "").trim();
