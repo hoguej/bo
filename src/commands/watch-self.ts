@@ -43,15 +43,16 @@ function newRequestId(): string {
   return randomBytes(4).toString("hex");
 }
 
-function getSelfHandle(): string | undefined {
-  const p = dbGetPrimaryUserPhone();
+async function getSelfHandle(): Promise<string | undefined> {
+  const p = await dbGetPrimaryUserPhone();
   if (p) return toE164(p);
   return process.env.BO_MY_PHONE ?? process.env.BO_MY_EMAIL ?? undefined;
 }
 
 /** Script or command that receives the message as first arg and prints the response to stdout. */
-function getAgentScript(): string | undefined {
-  return dbGetConfig("agent_script")?.trim() ?? process.env.BO_AGENT_SCRIPT?.trim() ?? undefined;
+async function getAgentScript(): Promise<string | undefined> {
+  const config = await dbGetConfig("agent_script");
+  return config?.trim() ?? process.env.BO_AGENT_SCRIPT?.trim() ?? undefined;
 }
 
 /** Message guids we sent (our replies). Never react to these. */
@@ -106,8 +107,8 @@ function senderDisplay(sender: string): string {
 }
 
 /** Optional: when any of these numbers send a message, we pass it to the agent and reply (any chat). From users.can_trigger_agent or env. */
-function getAgentNumbers(): Set<string> {
-  const fromDb = dbGetPhoneNumbersThatCanTriggerAgent();
+async function getAgentNumbers(): Promise<Set<string>> {
+  const fromDb = await dbGetPhoneNumbersThatCanTriggerAgent();
   if (fromDb.length > 0) return new Set(fromDb);
   const raw = process.env.BO_AGENT_NUMBERS ?? process.env.BO_AGENT_NUMBER ?? "";
   const set = new Set<string>();
@@ -224,7 +225,7 @@ function createTelegramBot(): Bot | null {
 
     if (/^\/(start|myid|id)(\s|$)/i.test(text)) return; // Handled by command handlers; skip agent
 
-    const userId = dbGetUserIdByTelegramId(telegramId);
+    const userId = await dbGetUserIdByTelegramId(telegramId);
     if (userId == null) {
       if (telegramUnknownRateLimit(telegramId)) return; // DOS: drop silently
       console.error(`[bo telegram] unknown telegram_id=${telegramId} text="${text.slice(0, 200)}${text.length > 200 ? "…" : ""}"`);
@@ -444,7 +445,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
   const guid = msg.guid ?? msg.id;
   if (!guid) return;
 
-  if (dbHasRepliedToMessage(guid)) return;
+  if (await dbHasRepliedToMessage(guid)) return;
   if (sentMessageGuids.has(guid)) return;
   if (text && recentSentReplyTexts.has(text)) return;
   if (processedMessageGuids.has(guid)) return;

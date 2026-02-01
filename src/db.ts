@@ -1,1391 +1,368 @@
 /**
- * Single SQLite DB at ~/.bo/bo.db for all non-secret data and config.
- * Schema: users, skills_registry, skills_access_default, skills_access_by_user,
- * facts, conversation, summary, personality, todos.
+ * PostgreSQL database layer with family-based multi-tenancy
+ * Replaces bun:sqlite with pg (node-postgres)
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { canonicalPhone } from "./phone";
+import { Pool, PoolClient } from "pg";
 
-const DEFAULT_BO_DIR = join(homedir(), ".bo");
-const DEFAULT_DB_PATH = join(DEFAULT_BO_DIR, "bo.db");
+let pool: Pool | null = null;
 
-function getDbPath(): string {
-  const override = process.env.BO_DB_PATH?.trim();
-  if (override) return override;
-  const base = process.env.BO_MEMORY_PATH?.trim() ? dirname(process.env.BO_MEMORY_PATH) : DEFAULT_BO_DIR;
-  return join(base, "bo.db");
+function getPool(): Pool {
+  if (pool) return pool;
+
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL environment variable not set");
+  }
+
+  pool = new Pool({
+    connectionString,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
+  });
+
+  return pool;
 }
 
-let db: import("bun:sqlite").Database | null = null;
-
-function getDb(): import("bun:sqlite").Database {
-  if (db) return db;
-  const path = getDbPath();
-  const dir = dirname(path);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const { Database } = require("bun:sqlite");
-  const database = new Database(path, { create: true });
-  db = database;
-  initSchema(database);
-  return database;
+export async function closeDb(): Promise<void> {
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
 }
 
-function initSchema(database: import("bun:sqlite").Database): void {
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      first_name TEXT NOT NULL,
-      last_name TEXT NOT NULL,
-      phone_number TEXT NOT NULL UNIQUE
+// ============================================================================
+// FAMILY CONTEXT HELPERS
+// ============================================================================
+
+/**
+ * Get family ID from Telegram context (group chat or DM)
+ */
+export async function getFamilyFromTelegramContext(chatId: string | number, userId: number): Promise<number> {
+  const pool = getPool();
+  
+  // If it's a group chat, look up family by chat_id
+  if (typeof chatId === 'number' && chatId < 0) {
+    const result = await pool.query(
+      'SELECT family_id FROM group_chats WHERE chat_id = $1',
+      [chatId.toString()]
     );
-    INSERT OR IGNORE INTO users (first_name, last_name, phone_number) VALUES ('Default', '', 'default');
-
-    CREATE TABLE IF NOT EXISTS skills_registry (
-      id TEXT NOT NULL PRIMARY KEY,
-      name TEXT NOT NULL,
-      description TEXT NOT NULL,
-      entrypoint TEXT NOT NULL,
-      input_schema TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS skills_access_default (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      allowed TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS skills_access_by_user (
-      user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      allowed TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS facts (
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      key TEXT NOT NULL,
-      value TEXT NOT NULL,
-      scope TEXT NOT NULL DEFAULT 'user',
-      tags TEXT NOT NULL DEFAULT '[]',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (user_id, key, scope)
-    );
-
-    CREATE TABLE IF NOT EXISTS conversation (
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      seq INTEGER NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      PRIMARY KEY (user_id, seq)
-    );
-
-    CREATE TABLE IF NOT EXISTS summary (
-      user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      sentences TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS personality (
-      user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      instructions TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS todos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      creator_user_id INTEGER REFERENCES users(id),
-      text TEXT NOT NULL,
-      done INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS watch_self_replied (
-      message_guid TEXT NOT NULL PRIMARY KEY,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS config (
-      key TEXT NOT NULL PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS llm_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      request_id TEXT NOT NULL,
-      owner TEXT NOT NULL,
-      user_id INTEGER REFERENCES users(id),
-      step TEXT NOT NULL,
-      request_doc TEXT,
-      response_text TEXT,
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS group_chats (
-      chat_id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      type TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-  `);
-  migrateOldTablesToUsers(database);
-  migrateOwnerColumnsToUserId(database);
-  migrateUsersAddCanTriggerAgent(database);
-  migrateUsersAddTelegramId(database);
-  database.run("DROP TABLE IF EXISTS inferences");
-  migrateFromJson(database, false);
-  database.run("CREATE INDEX IF NOT EXISTS idx_facts_user_id ON facts(user_id)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_conversation_user_seq ON conversation(user_id, seq)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_watch_self_replied_created_at ON watch_self_replied(created_at)");
-  migrateLlmLogAddOwner(database);
-  migrateLlmLogAddUserId(database);
-  migrateTodosAddCreator(database);
-  migrateFactsRemoveSystemKeys(database);
-  migrateUsersAddTimezoneIana(database);
-  migrateUsersSetTimezoneEt(database);
-  migrateTodosDropDue(database);
-  migrateScheduleStateTable(database);
-  migrateScheduleStateAddDailyTodosDate(database);
-  migrateRemindersTable(database);
-  migrateSkillsAccessNormalized(database);
-  migrateReminderSkill(database);
-  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_request_id ON llm_log(request_id)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_owner ON llm_log(owner)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_user_id ON llm_log(user_id)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_llm_log_created_at ON llm_log(created_at)");
-  normalizeUserPhoneNumbers(database);
-  seedConfigFromEnv(database);
-}
-
-/** One-time seed: copy BO_* env vars into config and users so you don't have to type them in the admin. */
-function seedConfigFromEnv(database: import("bun:sqlite").Database): void {
-  function getConfig(key: string): string | undefined {
-    const row = database.query("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined;
-    const v = row?.value?.trim();
-    return v || undefined;
-  }
-  function setConfig(key: string, value: string): void {
-    if (!value?.trim()) return;
-    database.run("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", [key, value.trim()]);
-  }
-  function findOrCreateUserByPhone(phoneCanonical: string): number | undefined {
-    if (!phoneCanonical || phoneCanonical === "default" || phoneCanonical.length < 10) return undefined;
-    let row = database.query("SELECT id FROM users WHERE phone_number = ?").get(phoneCanonical) as { id: number } | undefined;
-    if (row) return row.id;
-    database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", phoneCanonical]);
-    row = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
-    return row?.id;
-  }
-
-  if (!getConfig("primary_user_id")) {
-    const raw = process.env.BO_MY_PHONE?.trim() || process.env.BO_MY_EMAIL?.trim();
-    if (raw) {
-      const can = canonicalPhone(raw);
-      const id = findOrCreateUserByPhone(can);
-      if (id != null) setConfig("primary_user_id", String(id));
-    }
-  }
-  if (!getConfig("default_zip") && process.env.BO_DEFAULT_ZIP?.trim()) {
-    setConfig("default_zip", process.env.BO_DEFAULT_ZIP.trim());
-  }
-  if (!getConfig("llm_model") && process.env.BO_LLM_MODEL?.trim()) {
-    setConfig("llm_model", process.env.BO_LLM_MODEL.trim());
-  }
-  if (!getConfig("agent_script") && process.env.BO_AGENT_SCRIPT?.trim()) {
-    setConfig("agent_script", process.env.BO_AGENT_SCRIPT.trim());
-  }
-  const agentRaw = process.env.BO_AGENT_NUMBERS?.trim() || process.env.BO_AGENT_NUMBER?.trim();
-  if (agentRaw) {
-    for (const s of agentRaw.split(",")) {
-      const can = canonicalPhone(s.trim());
-      const id = findOrCreateUserByPhone(can);
-      if (id != null) database.run("UPDATE users SET can_trigger_agent = 1 WHERE id = ?", [id]);
-    }
-  }
-}
-
-/** One-time: add can_trigger_agent to users (who can trigger the agent in watch-self). */
-function migrateUsersAddCanTriggerAgent(database: import("bun:sqlite").Database): void {
-  const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
-  if (cols.some((c) => c.name === "can_trigger_agent")) return;
-  database.run("ALTER TABLE users ADD COLUMN can_trigger_agent INTEGER NOT NULL DEFAULT 1");
-  database.run("UPDATE users SET can_trigger_agent = 0 WHERE phone_number = 'default'");
-}
-
-/** One-time: add telegram_id to users (allowlist for Telegram; link to existing user). */
-/** One-time: add creator_user_id to todos (who created the todo; assignee is user_id). */
-function migrateTodosAddCreator(database: import("bun:sqlite").Database): void {
-  try {
-    const info = database.query("PRAGMA table_info(todos)").all() as { name: string }[];
-    if (info.some((c) => c.name === "creator_user_id")) return;
-    database.run("ALTER TABLE todos ADD COLUMN creator_user_id INTEGER REFERENCES users(id)");
-  } catch (_) {
-    /* table may not exist yet */
-  }
-}
-
-/** One-time: add timezone_iana to users (IANA timezone for schedule/reminders; fallback BO_DEFAULT_TZ). */
-function migrateUsersAddTimezoneIana(database: import("bun:sqlite").Database): void {
-  const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
-  if (cols.some((c) => c.name === "timezone_iana")) return;
-  database.run("ALTER TABLE users ADD COLUMN timezone_iana TEXT");
-}
-
-/** One-time: set all users to ET (America/New_York) where timezone_iana is null or empty. */
-function migrateUsersSetTimezoneEt(database: import("bun:sqlite").Database): void {
-  database.run("UPDATE users SET timezone_iana = ? WHERE timezone_iana IS NULL OR trim(timezone_iana) = ''", ["America/New_York"]);
-}
-
-/** One-time: drop due column from todos (only reminders have specific times). */
-function migrateTodosDropDue(database: import("bun:sqlite").Database): void {
-  const cols = database.query("PRAGMA table_info(todos)").all() as { name: string }[];
-  if (!cols.some((c) => c.name === "due")) return;
-  const hasCreator = cols.some((c) => c.name === "creator_user_id");
-  if (hasCreator) {
-    database.run(`
-      CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, creator_user_id INTEGER REFERENCES users(id), text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-      INSERT INTO todos_new (id, user_id, creator_user_id, text, done, created_at) SELECT id, user_id, creator_user_id, text, done, created_at FROM todos;
-      DROP TABLE todos;
-      ALTER TABLE todos_new RENAME TO todos;
-    `);
-  } else {
-    database.run(`
-      CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-      INSERT INTO todos_new (id, user_id, text, done, created_at) SELECT id, user_id, text, done, created_at FROM todos;
-      DROP TABLE todos;
-      ALTER TABLE todos_new RENAME TO todos;
-    `);
-  }
-  database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
-}
-
-/** One-time: create schedule_state table (per-user scheduler idempotency). */
-function migrateScheduleStateTable(database: import("bun:sqlite").Database): void {
-  database.run(`
-    CREATE TABLE IF NOT EXISTS schedule_state (
-      user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      last_convo_end_utc TEXT,
-      last_daily_starter_date TEXT,
-      last_4h_nudge_date TEXT,
-      last_overdue_reminder_date TEXT,
-      last_daily_todos_date TEXT
-    )
-  `);
-  database.run("CREATE INDEX IF NOT EXISTS idx_schedule_state_user_id ON schedule_state(user_id)");
-}
-
-/** One-time: add last_daily_todos_date to schedule_state (daily todo reminder). */
-function migrateScheduleStateAddDailyTodosDate(database: import("bun:sqlite").Database): void {
-  const cols = database.query("PRAGMA table_info(schedule_state)").all() as { name: string }[];
-  if (cols.some((c) => c.name === "last_daily_todos_date")) return;
-  database.run("ALTER TABLE schedule_state ADD COLUMN last_daily_todos_date TEXT");
-}
-
-/** One-time: normalize skills_access_default (one row per skill_id) and skills_access_by_user (one row per user_id+skill_id for extra only). */
-function migrateSkillsAccessNormalized(database: import("bun:sqlite").Database): void {
-  const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
-  const hasAllowed = defaultCols.some((c) => c.name === "allowed");
-  if (!hasAllowed) return;
-
-  const defaultRow = database.query("SELECT allowed FROM skills_access_default WHERE id = 1").get() as { allowed: string } | undefined;
-  let defaultList: string[] = [];
-  if (defaultRow) {
-    try {
-      const arr = JSON.parse(defaultRow.allowed) as unknown;
-      defaultList = Array.isArray(arr) ? (arr as string[]).filter((x) => typeof x === "string") : [];
-    } catch (_) {
-      /* ignore */
-    }
-  }
-  const defaultSet = new Set(defaultList);
-
-  database.run("CREATE TABLE IF NOT EXISTS skills_access_default_new (skill_id TEXT NOT NULL PRIMARY KEY)");
-  for (const skillId of defaultList) {
-    if (skillId) database.run("INSERT OR IGNORE INTO skills_access_default_new (skill_id) VALUES (?)", [skillId]);
-  }
-
-  database.run(`
-    CREATE TABLE IF NOT EXISTS skills_access_by_user_new (
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      skill_id TEXT NOT NULL,
-      PRIMARY KEY (user_id, skill_id)
-    )
-  `);
-  const byUserRows = database.query("SELECT user_id, allowed FROM skills_access_by_user").all() as { user_id: number; allowed: string }[];
-  for (const r of byUserRows) {
-    try {
-      const arr = JSON.parse(r.allowed) as unknown;
-      const allowed = Array.isArray(arr) ? (arr as string[]).filter((x) => typeof x === "string") : [];
-      const extra = allowed.filter((s) => !defaultSet.has(s));
-      for (const skillId of extra) {
-        if (skillId) database.run("INSERT OR IGNORE INTO skills_access_by_user_new (user_id, skill_id) VALUES (?, ?)", [r.user_id, skillId]);
-      }
-    } catch (_) {
-      /* ignore */
+    if (result.rows[0]) {
+      return result.rows[0].family_id;
     }
   }
 
-  database.run("DROP TABLE skills_access_by_user");
-  database.run("DROP TABLE skills_access_default");
-  database.run("ALTER TABLE skills_access_by_user_new RENAME TO skills_access_by_user");
-  database.run("ALTER TABLE skills_access_default_new RENAME TO skills_access_default");
+  // DM: use user's last_active_family_id
+  const result = await pool.query(
+    'SELECT last_active_family_id FROM users WHERE id = $1',
+    [userId]
+  );
+  
+  if (result.rows[0]?.last_active_family_id) {
+    return result.rows[0].last_active_family_id;
+  }
+
+  // Fallback: get user's first family
+  const fallback = await pool.query(
+    'SELECT family_id FROM family_memberships WHERE user_id = $1 LIMIT 1',
+    [userId]
+  );
+  
+  if (fallback.rows[0]) {
+    return fallback.rows[0].family_id;
+  }
+
+  throw new Error(`User ${userId} has no family memberships`);
 }
 
-/** One-time: insert reminder skill into registry if not present, and add to default skills access. */
-function migrateReminderSkill(database: import("bun:sqlite").Database): void {
-  const row = database.query("SELECT 1 FROM skills_registry WHERE id = ?").get("reminder") as { "1": number } | undefined;
-  if (!row) {
-    const inputSchema = JSON.stringify({
-      action: "create | list | update | delete",
-      text: "string (task to run at fire time; required for create)",
-      fire_at_iso: "string (UTC ISO time for one-off or first run; e.g. 2025-01-30T16:30:00.000Z)",
-      recurrence: "string (e.g. daily 08:30 for recurring)",
-      for_contact: "string (recipient first name; default self)",
-      reminder_id: "number (for update/delete)",
-      new_text: "string (for update)",
-      new_fire_at_iso: "string (for update)",
-      new_recurrence: "string (for update)",
-      filter: "for_me | by_me (for list)",
-    });
-    database.run(
-      "INSERT INTO skills_registry (id, name, description, entrypoint, input_schema) VALUES (?, ?, ?, ?, ?)",
-      [
-        "reminder",
-        "Reminders",
-        "Set, list, update, or cancel one-off and recurring reminders for yourself or others. Create: text, fire_at_iso (UTC), optional recurrence (e.g. daily 08:30), optional for_contact. List: optional filter for_me/by_me. Update/delete: reminder_id.",
-        "scripts/skills/reminder.ts",
-        inputSchema,
-      ]
-    );
-  }
-  const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
-  const hasSkillId = defaultCols.some((c) => c.name === "skill_id");
-  if (hasSkillId) {
-    database.run("INSERT OR IGNORE INTO skills_access_default (skill_id) VALUES (?)", ["reminder"]);
-  } else {
-    const defaultRow = database.query("SELECT allowed FROM skills_access_default WHERE id = 1").get() as { allowed: string } | undefined;
-    if (defaultRow) {
-      try {
-        const allowed = JSON.parse(defaultRow.allowed) as unknown;
-        const list = Array.isArray(allowed) ? (allowed as string[]).filter((x) => typeof x === "string") : [];
-        if (!list.includes("reminder")) {
-          list.push("reminder");
-          database.run("UPDATE skills_access_default SET allowed = ? WHERE id = 1", [JSON.stringify(list)]);
-        }
-      } catch (_) {
-        /* ignore */
-      }
-    }
-  }
-}
-
-/** One-time: create reminders table (one-off and recurring; creator + recipient). */
-function migrateRemindersTable(database: import("bun:sqlite").Database): void {
-  database.run(`
-    CREATE TABLE IF NOT EXISTS reminders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      creator_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      recipient_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      text TEXT NOT NULL,
-      kind TEXT NOT NULL CHECK (kind IN ('one_off', 'recurring')),
-      fire_at_utc TEXT,
-      recurrence TEXT,
-      next_fire_at_utc TEXT,
-      created_at TEXT NOT NULL,
-      sent_at TEXT,
-      last_fired_at TEXT
-    )
-  `);
-  database.run("CREATE INDEX IF NOT EXISTS idx_reminders_recipient_next ON reminders(recipient_user_id, next_fire_at_utc)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_reminders_fire_at ON reminders(fire_at_utc) WHERE kind = 'one_off'");
-}
-
-/** One-time: add owner column to llm_log so we can trace every request/response to request_id and user. */
-function migrateLlmLogAddOwner(database: import("bun:sqlite").Database): void {
-  try {
-    const info = database.query("PRAGMA table_info(llm_log)").all() as { name: string }[];
-    if (info.some((c) => c.name === "owner")) return;
-    database.run("ALTER TABLE llm_log ADD COLUMN owner TEXT NOT NULL DEFAULT 'default'");
-  } catch (_) {
-    /* table may not exist yet */
-  }
-}
-
-/** One-time: add user_id to llm_log and backfill from owner (phone or telegram:<id>). */
-function migrateLlmLogAddUserId(database: import("bun:sqlite").Database): void {
-  try {
-    const info = database.query("PRAGMA table_info(llm_log)").all() as { name: string }[];
-    const hasUserId = info.some((c) => c.name === "user_id");
-    if (!hasUserId) database.run("ALTER TABLE llm_log ADD COLUMN user_id INTEGER REFERENCES users(id)");
-    // Backfill (idempotent): owner is normalized to either canonical phone, "default", or "telegram:<id>".
-    database.run(
-      "UPDATE llm_log SET user_id = (SELECT id FROM users WHERE telegram_id = substr(owner, 10)) WHERE user_id IS NULL AND owner LIKE 'telegram:%'"
-    );
-    database.run(
-      "UPDATE llm_log SET user_id = (SELECT id FROM users WHERE phone_number = owner) WHERE user_id IS NULL AND owner NOT LIKE 'telegram:%'"
-    );
-  } catch (_) {
-    /* table may not exist yet */
-  }
-}
-
-function migrateUsersAddTelegramId(database: import("bun:sqlite").Database): void {
-  const cols = database.query("PRAGMA table_info(users)").all() as { name: string }[];
-  if (cols.some((c) => c.name === "telegram_id")) return;
-  database.run("ALTER TABLE users ADD COLUMN telegram_id TEXT");
-  database.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id) WHERE telegram_id IS NOT NULL");
-}
-
-/** One-time: normalize existing users.phone_number to canonical form (10-digit) so lookups match. */
-function normalizeUserPhoneNumbers(database: import("bun:sqlite").Database): void {
-  const rows = database.query("SELECT id, phone_number FROM users WHERE phone_number != 'default'").all() as { id: number; phone_number: string }[];
-  for (const r of rows) {
-    const can = canonicalPhone(r.phone_number);
-    if (can !== r.phone_number && can !== "default" && can.length >= 10) {
-      try {
-        database.run("UPDATE users SET phone_number = ? WHERE id = ?", [can, r.id]);
-      } catch {
-        /* UNIQUE violation if two rows collapse to same canonical; skip */
-      }
-    }
-  }
-}
-
-/** One-time: migrate legacy contacts → users, skills_access_by_number → skills_access_by_user. */
-function migrateOldTablesToUsers(database: import("bun:sqlite").Database): void {
-  const tables = database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('contacts', 'skills_access_by_number')").all() as { name: string }[];
-  const hasContacts = tables.some((t) => t.name === "contacts");
-  const hasByNumber = tables.some((t) => t.name === "skills_access_by_number");
-
-  if (hasContacts) {
-    const rows = database.query("SELECT name, number FROM contacts").all() as { name: string; number: string }[];
-    for (const r of rows) {
-      const num = canonicalPhone(r.number);
-      if (num.length < 10) continue;
-      const [first = "", ...rest] = (r.name || "").trim().split(/\s+/);
-      const last = rest.join(" ").trim();
-      database.run("INSERT OR IGNORE INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", [first, last, num]);
-    }
-    database.run("DROP TABLE contacts");
-  }
-
-  if (hasByNumber) {
-    const rows = database.query("SELECT number, allowed FROM skills_access_by_number").all() as { number: string; allowed: string }[];
-    for (const r of rows) {
-      const num = canonicalPhone(r.number);
-      if (num.length < 10) continue;
-      const row = database.query("SELECT id FROM users WHERE phone_number = ?").get(num) as { id: number } | undefined;
-      let userId: number;
-      if (row) {
-        userId = row.id;
-      } else {
-        database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", num]);
-        userId = (database.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
-      }
-      database.run("INSERT OR REPLACE INTO skills_access_by_user (user_id, allowed) VALUES (?, ?)", [userId, r.allowed]);
-    }
-    database.run("DROP TABLE skills_access_by_number");
-  }
-}
-
-/** Resolve owner string ("default", canonical phone, or "telegram:<id>") to user_id. For telegram:<id> only looks up (never creates). Returns undefined when Telegram ID has no user. */
-function resolveOwnerToUserId(database: import("bun:sqlite").Database, owner: string): number | undefined {
-  const trimmed = (owner ?? "").trim();
-  if (trimmed.startsWith("telegram:")) {
-    const id = trimmed.slice(9).trim();
-    if (!id) return undefined;
-    const row = database.query("SELECT id FROM users WHERE telegram_id = ?").get(id) as { id: number } | undefined;
-    return row?.id;
-  }
-  const key = !trimmed || trimmed === "default" ? "default" : canonicalPhone(trimmed);
-  const row = database.query("SELECT id FROM users WHERE phone_number = ?").get(key) as { id: number } | undefined;
-  if (row) return row.id;
-  if (key === "default") {
-    database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["Default", "", "default"]);
-    return (database.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
-  }
-  database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", key]);
-  return (database.query("SELECT last_insert_rowid() AS id").get() as { id: number }).id;
-}
-
-/** Map user_id back to owner string for API (default -> "default", else phone_number). */
-function userIdToOwner(database: import("bun:sqlite").Database, userId: number): string {
-  const row = database.query("SELECT phone_number FROM users WHERE id = ?").get(userId) as { phone_number: string } | undefined;
-  if (!row) return "default";
-  return row.phone_number === "default" ? "default" : row.phone_number;
-}
-
-/** One-time: migrate tables that have owner column to user_id. */
-function migrateOwnerColumnsToUserId(database: import("bun:sqlite").Database): void {
-  const cols = database.query("PRAGMA table_info(facts)").all() as { name: string }[];
-  const hasOwner = cols.some((c) => c.name === "owner");
-  if (!hasOwner) return;
-
-  const defaultUserId = resolveOwnerToUserId(database, "default");
-
-  database.exec(`
-    CREATE TABLE facts_new (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, key TEXT NOT NULL, value TEXT NOT NULL, scope TEXT NOT NULL DEFAULT 'user', tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (user_id, key, scope));
-    CREATE TABLE conversation_new (user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, seq INTEGER NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, PRIMARY KEY (user_id, seq));
-    CREATE TABLE summary_new (user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, sentences TEXT NOT NULL);
-    CREATE TABLE personality_new (user_id INTEGER NOT NULL PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, instructions TEXT NOT NULL);
-    CREATE TABLE todos_new (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
-  `);
-
-  const factRows = database.query("SELECT owner, key, value, scope, tags, created_at, updated_at FROM facts").all() as Array<{ owner: string; key: string; value: string; scope: string; tags: string; created_at: string; updated_at: string }>;
-  for (const r of factRows) {
-    const uid = r.owner === "default" ? defaultUserId : resolveOwnerToUserId(database, r.owner);
-    database.run("INSERT INTO facts_new (user_id, key, value, scope, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", [uid, r.key, r.value, r.scope, r.tags, r.created_at, r.updated_at]);
-  }
-
-  const convRows = database.query("SELECT owner, seq, role, content FROM conversation").all() as Array<{ owner: string; seq: number; role: string; content: string }>;
-  for (const r of convRows) {
-    const uid = r.owner === "default" ? defaultUserId : resolveOwnerToUserId(database, r.owner);
-    database.run("INSERT INTO conversation_new (user_id, seq, role, content) VALUES (?, ?, ?, ?)", [uid, r.seq, r.role, r.content]);
-  }
-
-  const sumRows = database.query("SELECT owner, sentences FROM summary").all() as Array<{ owner: string; sentences: string }>;
-  for (const r of sumRows) {
-    const uid = r.owner === "default" ? defaultUserId : resolveOwnerToUserId(database, r.owner);
-    database.run("INSERT INTO summary_new (user_id, sentences) VALUES (?, ?)", [uid, r.sentences]);
-  }
-
-  const persRows = database.query("SELECT owner, instructions FROM personality").all() as Array<{ owner: string; instructions: string }>;
-  for (const r of persRows) {
-    const uid = r.owner === "default" ? defaultUserId : resolveOwnerToUserId(database, r.owner);
-    database.run("INSERT INTO personality_new (user_id, instructions) VALUES (?, ?)", [uid, r.instructions]);
-  }
-
-  const todoRows = database.query("SELECT owner, text, done, created_at FROM todos").all() as Array<{ owner: string; text: string; done: number; created_at: string }>;
-  for (const r of todoRows) {
-    const uid = r.owner === "default" ? defaultUserId : resolveOwnerToUserId(database, r.owner);
-    database.run("INSERT INTO todos_new (user_id, text, done, created_at) VALUES (?, ?, ?, ?)", [uid, r.text, r.done, r.created_at]);
-  }
-
-  database.run("DROP TABLE facts");
-  database.run("DROP TABLE conversation");
-  database.run("DROP TABLE summary");
-  database.run("DROP TABLE personality");
-  database.run("DROP TABLE todos");
-  database.run("ALTER TABLE facts_new RENAME TO facts");
-  database.run("ALTER TABLE conversation_new RENAME TO conversation");
-  database.run("ALTER TABLE summary_new RENAME TO summary");
-  database.run("ALTER TABLE personality_new RENAME TO personality");
-  database.run("ALTER TABLE todos_new RENAME TO todos");
-  database.run("CREATE INDEX IF NOT EXISTS idx_facts_user_id ON facts(user_id)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_conversation_user_seq ON conversation(user_id, seq)");
-  database.run("CREATE INDEX IF NOT EXISTS idx_todos_user_id ON todos(user_id)");
-}
-
-/** Copy data from JSON files into the DB. When overwrite is true (e.g. `bo migrate`), replace DB contents with JSON. When false (first open), only fill empty tables. */
-function migrateFromJson(database: import("bun:sqlite").Database, overwrite: boolean): void {
-  const projectRoot = process.env.BO_PROJECT_ROOT?.trim() || process.cwd();
-  const boDir = dirname(getDbPath());
-
-  const usersCount = (database.query("SELECT COUNT(*) AS c FROM users").get() as { c: number })?.c ?? 0;
-  const doUsers = overwrite || usersCount === 0;
-  if (doUsers) {
-    if (overwrite) {
-      database.run("DELETE FROM skills_access_by_user");
-      database.run("DELETE FROM users");
-    }
-    // Users/contacts are managed in the DB (admin UI or legacy migration from old contacts table). No JSON import.
-  }
-
-  const registryCount = (database.query("SELECT COUNT(*) AS c FROM skills_registry").get() as { c: number })?.c ?? 0;
-  const doRegistry = overwrite || registryCount === 0;
-  if (doRegistry) {
-    if (overwrite) database.run("DELETE FROM skills_registry");
-    const registryPath = join(projectRoot, "skills", "registry.json");
-    if (existsSync(registryPath)) {
-      try {
-        const raw = readFileSync(registryPath, "utf-8");
-        const parsed = JSON.parse(raw) as { version?: number; skills?: Array<{ id: string; name: string; description: string; entrypoint: string; inputSchema?: unknown }> };
-        if (parsed?.version === 1 && Array.isArray(parsed.skills)) {
-          const stmt = database.prepare("INSERT INTO skills_registry (id, name, description, entrypoint, input_schema) VALUES (?, ?, ?, ?, ?)");
-          for (const s of parsed.skills) {
-            if (s?.id) stmt.run(s.id, s.name ?? "", s.description ?? "", s.entrypoint ?? "", JSON.stringify(s.inputSchema ?? {}));
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  const accessDefaultCount = (database.query("SELECT COUNT(*) AS c FROM skills_access_default").get() as { c: number })?.c ?? 0;
-  const doAccess = overwrite || accessDefaultCount === 0;
-  if (doAccess) {
-    const accessPath = join(projectRoot, "skills", "access.json");
-    if (existsSync(accessPath)) {
-      try {
-        const raw = readFileSync(accessPath, "utf-8");
-        const parsed = JSON.parse(raw) as { version?: number; default?: string[]; byNumber?: Record<string, string[]> };
-        if (parsed?.version === 1) {
-          const defaultAllowed = Array.isArray(parsed.default) ? parsed.default : [];
-          const defaultSet = new Set(defaultAllowed);
-          const byNumber = parsed.byNumber && typeof parsed.byNumber === "object" ? parsed.byNumber : {};
-          const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
-          const hasSkillId = defaultCols.some((c) => c.name === "skill_id");
-          if (hasSkillId) {
-            if (overwrite) database.run("DELETE FROM skills_access_default");
-            const stmtDefault = database.prepare("INSERT INTO skills_access_default (skill_id) VALUES (?)");
-            for (const skillId of defaultAllowed) {
-              if (skillId?.trim()) stmtDefault.run(skillId.trim());
-            }
-            if (overwrite) database.run("DELETE FROM skills_access_by_user");
-            for (const [num, allowed] of Object.entries(byNumber)) {
-              if (!Array.isArray(allowed)) continue;
-              const canonical = canonicalPhone(num);
-              if (canonical.length < 10) continue;
-              let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
-              if (!userRow) {
-                database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
-                userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
-              }
-              const extra = allowed.filter((s) => typeof s === "string" && s.trim() && !defaultSet.has(s.trim()));
-              const stmtUser = database.prepare("INSERT INTO skills_access_by_user (user_id, skill_id) VALUES (?, ?)");
-              for (const skillId of extra) {
-                if (skillId?.trim()) stmtUser.run(userRow.id, skillId.trim());
-              }
-            }
-          } else {
-            if (overwrite) database.run("DELETE FROM skills_access_default");
-            database.run("INSERT INTO skills_access_default (id, allowed) VALUES (1, ?)", [JSON.stringify(defaultAllowed)]);
-            if (overwrite) database.run("DELETE FROM skills_access_by_user");
-            for (const [num, allowed] of Object.entries(byNumber)) {
-              if (!Array.isArray(allowed)) continue;
-              const canonical = canonicalPhone(num);
-              if (canonical.length < 10) continue;
-              let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
-              if (!userRow) {
-                database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
-                userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
-              }
-              database.run("INSERT OR REPLACE INTO skills_access_by_user (user_id, allowed) VALUES (?, ?)", [userRow.id, JSON.stringify(allowed)]);
-            }
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  // --- Memory (facts), conversation, summary, personality, todos ---
-  const owners = new Set<string>(["default"]);
-  if (existsSync(boDir)) {
-    for (const f of readdirSync(boDir)) {
-      const m = f.match(/^memory_(.+)\.json$/) || f.match(/^conversation_(.+)\.json$/) || f.match(/^summary_(.+)\.json$/) || f.match(/^personality_(.+)\.json$/) || f.match(/^todos_(.+)\.json$/);
-      if (m) owners.add(m[1]!);
-    }
-  }
-
-  for (const owner of owners) {
-    const userId = resolveOwnerToUserId(database, owner);
-    if (overwrite) {
-      database.run("DELETE FROM facts WHERE user_id = ?", [userId]);
-      database.run("DELETE FROM conversation WHERE user_id = ?", [userId]);
-      database.run("DELETE FROM summary WHERE user_id = ?", [userId]);
-      database.run("DELETE FROM personality WHERE user_id = ?", [userId]);
-      database.run("DELETE FROM todos WHERE user_id = ?", [userId]);
-    }
-
-    // Facts from memory.json / memory_<owner>.json
-    const memoryFileName = owner === "default" ? "memory.json" : `memory_${owner}.json`;
-    const memoryPath = join(boDir, memoryFileName);
-    if (existsSync(memoryPath)) {
-      try {
-        const raw = readFileSync(memoryPath, "utf-8");
-        const mem = JSON.parse(raw) as { version?: number; facts?: Array<{ key: string; value: string; scope?: string; tags?: string[]; createdAt?: string; updatedAt?: string }> };
-        if (mem?.version === 1 && Array.isArray(mem.facts)) {
-          const now = new Date().toISOString();
-          const stmt = database.prepare("INSERT OR REPLACE INTO facts (user_id, key, value, scope, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
-          for (const f of mem.facts) {
-            const scope = f.scope === "global" ? "global" : "user";
-            stmt.run(userId, f.key ?? "", f.value ?? "", scope, JSON.stringify(f.tags ?? []), f.createdAt ?? now, f.updatedAt ?? now);
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    // Conversation
-    const convFileName = owner === "default" ? "conversation.json" : `conversation_${owner}.json`;
-    const convPath = join(boDir, convFileName);
-    if (existsSync(convPath)) {
-      try {
-        const raw = readFileSync(convPath, "utf-8");
-        const conv = JSON.parse(raw) as { messages?: Array<{ role: string; content: string }> };
-        if (Array.isArray(conv?.messages) && conv.messages.length) {
-          let seq = 1;
-          const stmt = database.prepare("INSERT INTO conversation (user_id, seq, role, content) VALUES (?, ?, ?, ?)");
-          for (const m of conv.messages) {
-            stmt.run(userId, seq++, m.role ?? "user", m.content ?? "");
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    // Summary
-    const sumFileName = owner === "default" ? "summary.json" : `summary_${owner}.json`;
-    const sumPath = join(boDir, sumFileName);
-    if (existsSync(sumPath)) {
-      try {
-        const raw = readFileSync(sumPath, "utf-8");
-        const sum = JSON.parse(raw) as { sentences?: string[] };
-        if (Array.isArray(sum?.sentences) && sum.sentences.length) {
-          database.run("INSERT OR REPLACE INTO summary (user_id, sentences) VALUES (?, ?)", [userId, JSON.stringify(sum.sentences)]);
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    // Personality
-    const persFileName = owner === "default" ? "personality.json" : `personality_${owner}.json`;
-    const persPath = join(boDir, persFileName);
-    if (existsSync(persPath)) {
-      try {
-        const raw = readFileSync(persPath, "utf-8");
-        const pers = JSON.parse(raw) as { instructions?: string[] };
-        if (Array.isArray(pers?.instructions) && pers.instructions.length) {
-          database.run("INSERT OR REPLACE INTO personality (user_id, instructions) VALUES (?, ?)", [userId, JSON.stringify(pers.instructions)]);
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-
-    // Todos
-    const todosFileName = owner === "default" ? "todos.json" : `todos_${owner}.json`;
-    const todosPath = join(boDir, todosFileName);
-    if (existsSync(todosPath)) {
-      try {
-        const raw = readFileSync(todosPath, "utf-8");
-        const arr = JSON.parse(raw) as unknown;
-        if (Array.isArray(arr) && arr.length) {
-          const stmt = database.prepare("INSERT INTO todos (user_id, text, done, created_at) VALUES (?, ?, ?, ?)");
-          for (const t of arr) {
-            const row = t as { text?: string; done?: boolean; createdAt?: string };
-            if (row && typeof row.text === "string") {
-              stmt.run(userId, row.text, row.done ? 1 : 0, row.createdAt ?? new Date().toISOString());
-            }
-          }
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-}
-
-export function closeDb(): void {
-  if (db) {
-    db.close();
-    db = null;
-  }
-}
-
-/** Open DB, copy all data from JSON files into the DB (overwriting), then close. Run `bo migrate` to move JSON data into the DB now. */
-export function runMigration(): void {
-  const database = getDb();
-  migrateFromJson(database, true);
-  closeDb();
-}
-
-// --- Raw DB (admin UI) ---
-export function dbGetTables(): string[] {
-  const database = getDb();
-  const rows = database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[];
-  return rows.map((r) => r.name);
-}
-
-export type DbColumnInfo = { cid: number; name: string; type: string; notnull: number; dflt_value: string | null; pk: number };
-export function dbGetTableInfo(tableName: string): DbColumnInfo[] {
-  const database = getDb();
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-  if (safe !== tableName) return [];
-  return database.query(`PRAGMA table_info(${safe})`).all() as DbColumnInfo[];
-}
-
-export type DbForeignKey = { id: number; seq: number; table: string; from: string; to: string };
-export function dbGetForeignKeys(tableName: string): DbForeignKey[] {
-  const database = getDb();
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-  if (safe !== tableName) return [];
-  return database.query(`PRAGMA foreign_key_list(${safe})`).all() as DbForeignKey[];
-}
-
-/** Run arbitrary SQL. Returns rows for SELECT; for writes returns { changes, lastId }. */
-export function dbRunQuery(sql: string, params: unknown[] = []): { columns?: string[]; rows?: Record<string, unknown>[]; changes?: number; lastId?: number; error?: string } {
-  const database = getDb();
-  try {
-    const trimmed = sql.trim();
-    const isSelect = /^\s*SELECT\s/i.test(trimmed);
-    if (isSelect) {
-      const stmt = database.query(trimmed);
-      const rows = stmt.all(...params) as Record<string, unknown>[];
-      const stmtAny = stmt as { columnNames?: string[] };
-      const columns = stmtAny.columnNames ?? (rows[0] ? Object.keys(rows[0]) : []);
-      return { columns, rows };
-    }
-    const result = database.run(trimmed, ...params) as { changes?: number; lastInsertRowid?: number };
-    return { changes: result.changes ?? 0, lastId: result.lastInsertRowid ?? undefined };
-  } catch (e) {
-    return { error: String(e) };
-  }
-}
-
-/** Get one row from table where column = value (for FK drill-down). */
-export function dbGetRowByColumn(tableName: string, column: string, value: unknown): Record<string, unknown> | null {
-  const database = getDb();
-  const safeTable = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-  const safeCol = column.replace(/[^a-zA-Z0-9_]/g, "");
-  if (safeTable !== tableName || safeCol !== column) return null;
-  const row = database.query(`SELECT * FROM ${safeTable} WHERE ${safeCol} = ?`).get(value) as Record<string, unknown> | undefined;
-  return row ?? null;
-}
-
-/** Insert one LLM prompt/response log row (request_id, owner, step, request_doc, response_text). Every request to the AI and every response is logged and traceable to request_id and user. */
-export function dbInsertLlmLog(
-  requestId: string,
-  owner: string,
-  step: string,
-  requestDoc: unknown,
-  responseText: string
-): void {
-  const database = getDb();
-  const created_at = new Date().toISOString();
-  const request_doc = typeof requestDoc === "string" ? requestDoc : JSON.stringify(requestDoc);
-  const user_id = resolveOwnerToUserId(database, owner ?? "default") ?? null;
-  database.run(
-    "INSERT INTO llm_log (request_id, owner, user_id, step, request_doc, response_text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    [requestId, owner ?? "default", user_id, step, request_doc, responseText ?? "", created_at]
+/**
+ * Update user's last active family
+ */
+export async function updateLastActiveFamily(userId: number, familyId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    'UPDATE users SET last_active_family_id = $1, updated_at = NOW() WHERE id = $2',
+    [familyId, userId]
   );
 }
 
-/** Get users by ids for admin UI (display "Name (id)" for user_id FKs). */
-export function dbGetUsersByIds(ids: number[]): Array<{ id: number; first_name: string; last_name: string }> {
-  if (ids.length === 0) return [];
-  const database = getDb();
-  const placeholders = ids.map(() => "?").join(",");
-  return database.query(`SELECT id, first_name, last_name FROM users WHERE id IN (${placeholders})`).all(...ids) as Array<{ id: number; first_name: string; last_name: string }>;
+/**
+ * Check if user has access to family
+ */
+export async function userHasAccessToFamily(userId: number, familyId: number): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT 1 FROM family_memberships WHERE user_id = $1 AND family_id = $2',
+    [userId, familyId]
+  );
+  return result.rows.length > 0;
 }
 
-/** Get one user by id (for todo creator display name). Returns null if not found. */
-export function dbGetUserById(id: number): { id: number; first_name: string; last_name: string; phone_number: string } | null {
-  const database = getDb();
-  const row = database.query("SELECT id, first_name, last_name, phone_number FROM users WHERE id = ?").get(id) as { id: number; first_name: string; last_name: string; phone_number: string } | undefined;
-  return row ?? null;
+/**
+ * Get user's role in family
+ */
+export async function getUserRoleInFamily(userId: number, familyId: number): Promise<'owner' | 'manager' | 'member' | null> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT role FROM family_memberships WHERE user_id = $1 AND family_id = $2',
+    [userId, familyId]
+  );
+  return result.rows[0]?.role || null;
 }
 
-/** Primary key column names for a table (ordered by pk). */
-export function dbGetPkColumns(tableName: string): string[] {
-  const cols = dbGetTableInfo(tableName);
-  return cols.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name);
+// ============================================================================
+// USERS
+// ============================================================================
+
+export async function dbGetUserIdByTelegramId(telegramId: string): Promise<number | undefined> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT id FROM users WHERE telegram_id = $1',
+    [telegramId]
+  );
+  return result.rows[0]?.id;
 }
 
-/** Insert a row; returns lastInsertRowid or error. */
-export function dbInsertRow(tableName: string, data: Record<string, unknown>): { lastId?: number; error?: string } {
-  const database = getDb();
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-  if (safe !== tableName) return { error: "Invalid table name" };
-  let entries = Object.entries(data).filter(([, v]) => v !== undefined) as [string, unknown][];
-  if (safe === "todos") entries = entries.filter(([k]) => k !== "due");
-  const cols = entries.map(([k]) => k.replace(/[^a-zA-Z0-9_]/g, "")).filter((c) => c.length > 0);
-  if (entries.length !== cols.length || cols.some((c) => c.length === 0)) return { error: "Invalid column name" };
-  const values = entries.map(([, v]) => v);
-  try {
-    const result = database.run(`INSERT INTO ${safe} (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`, ...values) as { lastInsertRowid?: number };
-    return { lastId: result.lastInsertRowid ?? undefined };
-  } catch (e) {
-    return { error: String(e) };
-  }
+export async function dbGetUserById(id: number) {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT id, first_name, last_name, phone_number, telegram_id, timezone_iana FROM users WHERE id = $1',
+    [id]
+  );
+  return result.rows[0] || null;
 }
 
-/** Update row by primary key. */
-export function dbUpdateRow(tableName: string, pk: Record<string, unknown>, data: Record<string, unknown>): { changes?: number; error?: string } {
-  const database = getDb();
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-  if (safe !== tableName) return { error: "Invalid table name" };
-  const pkCols = dbGetPkColumns(tableName);
-  if (pkCols.length === 0) return { error: "No primary key" };
-  let setCols = Object.keys(data).filter((k) => data[k] !== undefined && !pkCols.includes(k)).map((k) => k.replace(/[^a-zA-Z0-9_]/g, ""));
-  if (safe === "todos") setCols = setCols.filter((c) => c !== "due");
-  if (setCols.length === 0) return { error: "No columns to update" };
-  const setClause = setCols.map((c) => `${c} = ?`).join(", ");
-  const whereClause = pkCols.map((c) => `${c} = ?`).join(" AND ");
-  const values = [...setCols.map((c) => data[c]), ...pkCols.map((c) => pk[c])];
-  try {
-    const result = database.run(`UPDATE ${safe} SET ${setClause} WHERE ${whereClause}`, ...values) as { changes?: number };
-    return { changes: result.changes ?? 0 };
-  } catch (e) {
-    return { error: String(e) };
-  }
+export async function dbGetAllUsers() {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT id, first_name, last_name, phone_number, telegram_id FROM users ORDER BY last_name, first_name'
+  );
+  return result.rows;
 }
 
-/** Delete row by primary key. */
-export function dbDeleteRow(tableName: string, pk: Record<string, unknown>): { changes?: number; error?: string } {
-  const database = getDb();
-  const safe = tableName.replace(/[^a-zA-Z0-9_]/g, "");
-  if (safe !== tableName) return { error: "Invalid table name" };
-  const pkCols = dbGetPkColumns(tableName);
-  if (pkCols.length === 0) return { error: "No primary key" };
-  const whereClause = pkCols.map((c) => `${c} = ?`).join(" AND ");
-  const values = pkCols.map((c) => pk[c]);
-  try {
-    const result = database.run(`DELETE FROM ${safe} WHERE ${whereClause}`, ...values) as { changes?: number };
-    return { changes: result.changes ?? 0 };
-  } catch (e) {
-    return { error: String(e) };
-  }
+// ============================================================================
+// FACTS
+// ============================================================================
+
+export async function dbGetFacts(userId: number, familyId: number) {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT key, value, scope, tags, created_at AS "createdAt", updated_at AS "updatedAt"
+     FROM facts
+     WHERE (user_id = $1 AND family_id = $2) OR (scope = 'global')
+     ORDER BY created_at DESC`,
+    [userId, familyId]
+  );
+  return result.rows.map(row => ({
+    ...row,
+    tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : row.tags
+  }));
 }
 
-// --- Users (contacts) ---
-function userDisplayName(first: string | null, last: string | null): string {
-  return [first, last].filter(Boolean).map((s) => s!.trim()).filter(Boolean).join(" ") || "";
-}
-
-export function dbGetContactsNumberToName(): Map<string, string> {
-  const database = getDb();
-  const rows = database.query("SELECT first_name, last_name, phone_number FROM users").all() as { first_name: string; last_name: string; phone_number: string }[];
-  const map = new Map<string, string>();
-  for (const r of rows) {
-    const num = canonicalPhone(r.phone_number);
-    if (num.length >= 10) map.set(num, userDisplayName(r.first_name, r.last_name));
-  }
-  return map;
-}
-
-export function dbGetAllUsers(): Array<{ id: number; first_name: string | null; last_name: string | null; telegram_id: string | null; phone_number: string }> {
-  const database = getDb();
-  return database.query("SELECT id, first_name, last_name, telegram_id, phone_number FROM users").all() as Array<{ id: number; first_name: string | null; last_name: string | null; telegram_id: string | null; phone_number: string }>;
-}
-
-export function dbGetContactsNameToNumber(): Map<string, string> {
-  const database = getDb();
-  const rows = database.query("SELECT first_name, last_name, phone_number FROM users").all() as { first_name: string; last_name: string; phone_number: string }[];
-  const map = new Map<string, string>();
-  for (const r of rows) {
-    const num = canonicalPhone(r.phone_number);
-    map.set(userDisplayName(r.first_name, r.last_name).toLowerCase(), num);
-  }
-  return map;
-}
-
-export function dbGetContactsList(): Array<{ name: string; number: string }> {
-  const database = getDb();
-  const rows = database.query("SELECT first_name, last_name, phone_number FROM users ORDER BY last_name, first_name").all() as { first_name: string; last_name: string; phone_number: string }[];
-  return rows.map((r) => ({ name: userDisplayName(r.first_name, r.last_name), number: r.phone_number }));
-}
-
-export function dbSetContacts(entries: Array<{ name: string; number: string }>): void {
-  const database = getDb();
-  const numbers = new Set<string>();
-  for (const e of entries) {
-    if (e.number?.trim()) numbers.add(canonicalPhone(e.number.trim()));
-  }
-  if (numbers.size) {
-    const placeholders = Array.from(numbers).map(() => "?").join(",");
-    database.run(`DELETE FROM users WHERE phone_number NOT IN (${placeholders})`, Array.from(numbers));
-  } else {
-    database.run("DELETE FROM users");
-  }
-  const stmt = database.prepare("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?) ON CONFLICT(phone_number) DO UPDATE SET first_name = excluded.first_name, last_name = excluded.last_name");
-  for (const e of entries) {
-    if (!e.name?.trim() || !e.number?.trim()) continue;
-    const num = canonicalPhone(e.number.trim());
-    if (num.length < 10) continue;
-    const [first = "", ...rest] = e.name.trim().split(/\s+/);
-    const last = rest.join(" ").trim();
-    stmt.run(first, last, num);
-  }
-}
-
-// --- Config (key/value: default_zip, llm_model, primary_user_id, etc.) ---
-export function dbGetConfig(key: string): string | undefined {
-  const database = getDb();
-  const row = database.query("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined;
-  return row?.value;
-}
-
-export function dbSetConfig(key: string, value: string): void {
-  const database = getDb();
-  database.run("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", [key, String(value)]);
-}
-
-/** Primary user's phone (for self-chat / send-self). From config.primary_user_id -> users.phone_number, or undefined. */
-export function dbGetPrimaryUserPhone(): string | undefined {
-  const idStr = dbGetConfig("primary_user_id");
-  if (!idStr?.trim()) return undefined;
-  const id = parseInt(idStr.trim(), 10);
-  if (Number.isNaN(id)) return undefined;
-  const database = getDb();
-  const row = database.query("SELECT phone_number FROM users WHERE id = ?").get(id) as { phone_number: string } | undefined;
-  return row?.phone_number;
-}
-
-/** Resolve owner string (default, phone, or telegram:<id>) to user_id. For use when updating schedule state (e.g. last_convo_end_utc). */
-export function dbResolveOwnerToUserId(owner: string): number | undefined {
-  return resolveOwnerToUserId(getDb(), owner?.trim() || "default");
-}
-
-/** Get owner string (phone or telegram:<id>) for a user_id. Used by scheduler to set BO_REQUEST_FROM and send reply. */
-export function dbGetOwnerByUserId(userId: number): string {
-  const database = getDb();
-  const row = database.query("SELECT phone_number, telegram_id FROM users WHERE id = ?").get(userId) as { phone_number: string; telegram_id: string | null } | undefined;
-  if (!row) return "default";
-  if (row.telegram_id?.trim()) return "telegram:" + row.telegram_id.trim();
-  return row.phone_number === "default" ? "default" : row.phone_number;
-}
-
-/** Resolve Telegram user id to user_id (for allowlist). Returns undefined if no user has that telegram_id. */
-export function dbGetUserIdByTelegramId(telegramId: string): number | undefined {
-  const id = (telegramId ?? "").toString().trim();
-  if (!id) return undefined;
-  const database = getDb();
-  const row = database.query("SELECT id FROM users WHERE telegram_id = ?").get(id) as { id: number } | undefined;
-  return row?.id;
-}
-
-/** Get telegram_id for a user identified by canonical phone. Used to prefer Telegram when sending to a contact. */
-export function dbGetTelegramIdByPhone(phone: string): string | undefined {
-  const can = canonicalPhone((phone ?? "").trim());
-  if (!can || can === "default" || can.length < 10) return undefined;
-  const database = getDb();
-  const row = database.query("SELECT telegram_id FROM users WHERE phone_number = ?").get(can) as { telegram_id: string | null } | undefined;
-  const tid = row?.telegram_id?.trim();
-  return tid || undefined;
-}
-
-/** Phone numbers that can trigger the agent (watch-self). From users where can_trigger_agent = 1. */
-export function dbGetPhoneNumbersThatCanTriggerAgent(): string[] {
-  const database = getDb();
-  const rows = database
-    .query("SELECT phone_number FROM users WHERE can_trigger_agent = 1 AND phone_number != 'default'")
-    .all() as { phone_number: string }[];
-  return rows.map((r) => canonicalPhone(r.phone_number)).filter((n) => n.length >= 10);
-}
-
-// --- Watch-self: which incoming messages we've already replied to (persistent, survives restart) ---
-const WATCH_SELF_REPLIED_MAX = 2000;
-
-export function dbHasRepliedToMessage(messageGuid: string): boolean {
-  if (!messageGuid) return false;
-  const database = getDb();
-  const row = database.query("SELECT 1 FROM watch_self_replied WHERE message_guid = ?").get(messageGuid) as { "1": number } | undefined;
-  return !!row;
-}
-
-export function dbMarkMessageReplied(messageGuid: string): void {
-  if (!messageGuid) return;
-  const database = getDb();
-  database.run("INSERT OR IGNORE INTO watch_self_replied (message_guid, created_at) VALUES (?, ?)", [messageGuid, new Date().toISOString()]);
-  const count = database.query("SELECT COUNT(*) as c FROM watch_self_replied").get() as { c: number };
-  if (count.c > WATCH_SELF_REPLIED_MAX) {
-    const limit = count.c - WATCH_SELF_REPLIED_MAX;
-    database.run(
-      "DELETE FROM watch_self_replied WHERE message_guid IN (SELECT message_guid FROM watch_self_replied ORDER BY created_at ASC LIMIT " + limit + ")"
-    );
-  }
-}
-
-/** All distinct owners (for admin UI dropdown). Returns owner strings (e.g. "default", phone numbers). */
-export function dbGetAllOwners(): string[] {
-  const database = getDb();
-  const rows = database.query(`
-    SELECT user_id FROM facts
-    UNION SELECT user_id FROM conversation
-    UNION SELECT user_id FROM summary
-    UNION SELECT user_id FROM personality
-    UNION SELECT user_id FROM todos
-    ORDER BY user_id
-  `).all() as { user_id: number }[];
-  const set = new Set(rows.map((r) => r.user_id));
-  const list = Array.from(set).map((id) => userIdToOwner(database, id));
-  if (!list.includes("default")) list.unshift("default");
-  return list;
-}
-
-// --- Skills registry ---
-export type SkillRow = { id: string; name: string; description: string; entrypoint: string; input_schema: string };
-
-export function dbGetSkillsRegistry(): SkillRow[] {
-  const database = getDb();
-  return database.query("SELECT id, name, description, entrypoint, input_schema FROM skills_registry").all() as SkillRow[];
-}
-
-export function dbSetSkillsRegistry(skills: Array<{ id: string; name: string; description: string; entrypoint: string; inputSchema: unknown }>): void {
-  const database = getDb();
-  database.run("DELETE FROM skills_registry");
-  const stmt = database.prepare("INSERT INTO skills_registry (id, name, description, entrypoint, input_schema) VALUES (?, ?, ?, ?, ?)");
-  for (const s of skills) {
-    stmt.run(s.id, s.name, s.description, s.entrypoint, JSON.stringify(s.inputSchema ?? {}));
-  }
-}
-
-// --- Skills access ---
-export function dbGetSkillsAccessDefault(): string[] {
-  const database = getDb();
-  const cols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
-  const hasSkillId = cols.some((c) => c.name === "skill_id");
-  if (hasSkillId) {
-    const rows = database.query("SELECT skill_id FROM skills_access_default ORDER BY skill_id").all() as { skill_id: string }[];
-    return rows.map((r) => r.skill_id).filter(Boolean);
-  }
-  const row = database.query("SELECT allowed FROM skills_access_default WHERE id = 1").get() as { allowed: string } | undefined;
-  if (!row) return [];
-  try {
-    const arr = JSON.parse(row.allowed) as unknown;
-    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-export function dbGetSkillsAccessByNumber(): Record<string, string[]> {
-  const database = getDb();
-  const defaultList = dbGetSkillsAccessDefault();
-  const defaultSet = new Set(defaultList);
-  const cols = database.query("PRAGMA table_info(skills_access_by_user)").all() as { name: string }[];
-  const hasSkillId = cols.some((c) => c.name === "skill_id");
-  if (hasSkillId) {
-    const rows = database.query(`
-      SELECT u.id AS user_id, u.phone_number, u.telegram_id, s.skill_id FROM skills_access_by_user s
-      JOIN users u ON s.user_id = u.id
-    `).all() as { user_id: number; phone_number: string; telegram_id: string | null; skill_id: string }[];
-    const byUserId = new Map<number, Set<string>>();
-    const userToIdentifiers = new Map<number, { phone: string; telegramId: string | null }>();
-    for (const r of rows) {
-      const uid = r.user_id;
-      if (!userToIdentifiers.has(uid)) {
-        userToIdentifiers.set(uid, { phone: canonicalPhone(r.phone_number), telegramId: r.telegram_id?.trim() || null });
-      }
-      if (!byUserId.has(uid)) byUserId.set(uid, new Set());
-      byUserId.get(uid)!.add(r.skill_id);
-    }
-    const out: Record<string, string[]> = {};
-    for (const [uid, extraSet] of byUserId) {
-      const allowed = [...defaultList, ...extraSet].filter((x, i, a) => a.indexOf(x) === i);
-      const ids = userToIdentifiers.get(uid);
-      if (ids?.phone) out[ids.phone] = allowed;
-      if (ids?.telegramId) out["telegram:" + ids.telegramId] = allowed;
-    }
-    return out;
-  }
-  const rows = database.query(`
-    SELECT u.phone_number, u.telegram_id, s.allowed FROM skills_access_by_user s
-    JOIN users u ON s.user_id = u.id
-  `).all() as { phone_number: string; telegram_id: string | null; allowed: string }[];
-  const out: Record<string, string[]> = {};
-  for (const r of rows) {
-    try {
-      const arr = JSON.parse(r.allowed) as unknown;
-      const allowed = Array.isArray(arr) ? arr.filter((x): x is string => typeof x === "string") : [];
-      const num = canonicalPhone(r.phone_number);
-      if (num) out[num] = allowed;
-      const tid = r.telegram_id?.trim();
-      if (tid) out["telegram:" + tid] = allowed;
-    } catch {
-      const num = canonicalPhone(r.phone_number);
-      if (num) out[num] = [];
-    }
-  }
-  return out;
-}
-
-export function dbSetSkillsAccess(defaultAllowed: string[], byNumber: Record<string, string[]>): void {
-  const database = getDb();
-  const defaultCols = database.query("PRAGMA table_info(skills_access_default)").all() as { name: string }[];
-  const hasSkillId = defaultCols.some((c) => c.name === "skill_id");
-  const defaultSet = new Set(defaultAllowed);
-
-  if (hasSkillId) {
-    database.run("DELETE FROM skills_access_default");
-    const stmtDefault = database.prepare("INSERT INTO skills_access_default (skill_id) VALUES (?)");
-    for (const skillId of defaultAllowed) {
-      if (skillId?.trim()) stmtDefault.run(skillId.trim());
-    }
-    database.run("DELETE FROM skills_access_by_user");
-    for (const [num, allowed] of Object.entries(byNumber)) {
-      if (!Array.isArray(allowed)) continue;
-      const canonical = canonicalPhone(num);
-      if (canonical.length < 10) continue;
-      let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
-      if (!userRow) {
-        database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
-        userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
-      }
-      const extra = allowed.filter((s) => typeof s === "string" && s.trim() && !defaultSet.has(s.trim()));
-      const stmtUser = database.prepare("INSERT INTO skills_access_by_user (user_id, skill_id) VALUES (?, ?)");
-      for (const skillId of extra) {
-        if (skillId?.trim()) stmtUser.run(userRow.id, skillId.trim());
-      }
-    }
-    return;
-  }
-  database.run("DELETE FROM skills_access_default");
-  database.run("INSERT INTO skills_access_default (id, allowed) VALUES (1, ?)", [JSON.stringify(defaultAllowed)]);
-  database.run("DELETE FROM skills_access_by_user");
-  for (const [num, allowed] of Object.entries(byNumber)) {
-    if (!Array.isArray(allowed)) continue;
-    const canonical = canonicalPhone(num);
-    if (canonical.length < 10) continue;
-    let userRow = database.query("SELECT id FROM users WHERE phone_number = ?").get(canonical) as { id: number } | undefined;
-    if (!userRow) {
-      database.run("INSERT INTO users (first_name, last_name, phone_number) VALUES (?, ?, ?)", ["", "", canonical]);
-      userRow = database.query("SELECT last_insert_rowid() AS id").get() as { id: number };
-    }
-    database.run("INSERT INTO skills_access_by_user (user_id, allowed) VALUES (?, ?)", [userRow.id, JSON.stringify(allowed)]);
-  }
-}
-
-// --- Facts ---
-/** Keys that belong in users/config, not in facts. Never save these as facts; migration removes any that exist. */
-export const FACTS_RESERVED_KEYS = [
-  "can_trigger_agent",
-  "telegram_id",
-  "phone_number",
-  "first_name",
-  "last_name",
-] as const;
-
-export function isReservedFactKey(key: string): boolean {
-  const k = key.trim().toLowerCase();
-  return (FACTS_RESERVED_KEYS as readonly string[]).some((r) => r.toLowerCase() === k);
-}
-
-/** One-time: remove facts that are user-record/system data (can_trigger_agent, telegram_id, etc.). */
-function migrateFactsRemoveSystemKeys(database: import("bun:sqlite").Database): void {
-  const placeholders = FACTS_RESERVED_KEYS.map(() => "?").join(",");
-  database.run(`DELETE FROM facts WHERE LOWER(TRIM(key)) IN (${placeholders})`, FACTS_RESERVED_KEYS.map((s) => s.toLowerCase()));
-}
-
-export function dbGetFacts(owner: string): Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }> {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return [];
-  
-  // Get both user-specific facts and global facts (stored with user_id=1, scope='global')
-  const userFacts = database.query("SELECT key, value, scope, tags, created_at AS createdAt, updated_at AS updatedAt FROM facts WHERE user_id = ?").all(userId) as Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }>;
-  
-  // Get global facts if this isn't already the default user
-  if (userId !== 1) {
-    const globalFacts = database.query("SELECT key, value, scope, tags, created_at AS createdAt, updated_at AS updatedAt FROM facts WHERE user_id = 1 AND scope = 'global'").all() as Array<{ key: string; value: string; scope: string; tags: string; createdAt: string; updatedAt: string }>;
-    return [...globalFacts, ...userFacts];
-  }
-  
-  return userFacts;
-}
-
-export function dbUpsertFact(owner: string, key: string, value: string, scope: string, tags: string[]): void {
-  if (isReservedFactKey(key)) return;
-  const database = getDb();
-  
-  // Global facts are stored with user_id=1 regardless of who creates them
-  const userId = scope === 'global' ? 1 : resolveOwnerToUserId(database, owner);
-  if (userId == null) return;
-  
-  const now = new Date().toISOString();
-  const tagsJson = JSON.stringify(tags);
-  database.run(
-    `INSERT INTO facts (user_id, key, value, scope, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(user_id, key, scope) DO UPDATE SET value = ?, tags = ?, updated_at = ?`,
-    [userId, key, value, scope, tagsJson, now, now, value, tagsJson, now]
+export async function dbUpsertFact(
+  userId: number,
+  familyId: number,
+  key: string,
+  value: string,
+  scope: string,
+  tags: string[]
+): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO facts (user_id, family_id, key, value, scope, tags, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+     ON CONFLICT (user_id, family_id, key, scope)
+     DO UPDATE SET value = $4, tags = $6, updated_at = NOW()`,
+    [userId, familyId, key, value, scope, JSON.stringify(tags)]
   );
 }
 
-export function dbDeleteFact(owner: string, key: string, scope: string): boolean {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return false;
-  const result = database.run("DELETE FROM facts WHERE user_id = ? AND key = ? AND scope = ?", [userId, key, scope]);
-  return (result as { changes: number }).changes > 0;
+export async function dbDeleteFact(userId: number, familyId: number, key: string, scope: string): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    'DELETE FROM facts WHERE user_id = $1 AND family_id = $2 AND key = $3 AND scope = $4',
+    [userId, familyId, key, scope]
+  );
+  return (result.rowCount || 0) > 0;
 }
 
-// --- Conversation ---
-export function dbGetConversation(owner: string, max: number): Array<{ role: string; content: string }> {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return [];
-  const rows = database.query("SELECT role, content FROM conversation WHERE user_id = ? ORDER BY seq DESC LIMIT ?").all(userId, max) as Array<{ role: string; content: string }>;
-  return rows.reverse();
+// ============================================================================
+// CONVERSATION
+// ============================================================================
+
+export async function dbGetConversation(userId: number, familyId: number, max: number) {
+  const pool = getPool();
+  const result = await pool.query(
+    `SELECT role, content
+     FROM conversation
+     WHERE user_id = $1 AND family_id = $2
+     ORDER BY seq DESC
+     LIMIT $3`,
+    [userId, familyId, max]
+  );
+  return result.rows.reverse();
 }
 
-export function dbAppendConversation(owner: string, userContent: string, assistantContent: string, maxMessages: number): void {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return;
-  const next = database.query("SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM conversation WHERE user_id = ?").get(userId) as { n: number };
-  const seq = next?.n ?? 1;
-  database.run("INSERT INTO conversation (user_id, seq, role, content) VALUES (?, ?, 'user', ?)", [userId, seq, userContent.trim()]);
-  database.run("INSERT INTO conversation (user_id, seq, role, content) VALUES (?, ?, 'assistant', ?)", [userId, seq + 1, assistantContent.trim()]);
-  const count = database.query("SELECT COUNT(*) AS c FROM conversation WHERE user_id = ?").get(userId) as { c: number };
-  if (count && count.c > maxMessages) {
-    const toDelete = count.c - maxMessages;
-    database.run(`DELETE FROM conversation WHERE user_id = ? AND seq IN (SELECT seq FROM conversation WHERE user_id = ? ORDER BY seq LIMIT ?)`, [userId, userId, toDelete]);
+export async function dbAppendConversation(
+  userId: number,
+  familyId: number,
+  userContent: string,
+  assistantContent: string,
+  maxMessages: number
+): Promise<void> {
+  const pool = getPool();
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Get next sequence number
+    const seqResult = await client.query(
+      'SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM conversation WHERE user_id = $1 AND family_id = $2',
+      [userId, familyId]
+    );
+    const seq = seqResult.rows[0].next_seq;
+
+    // Insert user message
+    await client.query(
+      `INSERT INTO conversation (user_id, family_id, seq, role, content, created_at)
+       VALUES ($1, $2, $3, 'user', $4, NOW())`,
+      [userId, familyId, seq, userContent.trim()]
+    );
+
+    // Insert assistant message
+    await client.query(
+      `INSERT INTO conversation (user_id, family_id, seq, role, content, created_at)
+       VALUES ($1, $2, $3, 'assistant', $4, NOW())`,
+      [userId, familyId, seq + 1, assistantContent.trim()]
+    );
+
+    // Trim old messages
+    const countResult = await client.query(
+      'SELECT COUNT(*) AS count FROM conversation WHERE user_id = $1 AND family_id = $2',
+      [userId, familyId]
+    );
+    const count = parseInt(countResult.rows[0].count);
+
+    if (count > maxMessages) {
+      const toDelete = count - maxMessages;
+      await client.query(
+        `DELETE FROM conversation
+         WHERE user_id = $1 AND family_id = $2
+         AND seq IN (
+           SELECT seq FROM conversation
+           WHERE user_id = $1 AND family_id = $2
+           ORDER BY seq ASC
+           LIMIT $3
+         )`,
+        [userId, familyId, toDelete]
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
   }
 }
 
-// --- Summary ---
-const MAX_SUMMARY_SENTENCES = 50;
+// ============================================================================
+// SUMMARY
+// ============================================================================
 
-export function dbAppendSummarySentence(owner: string, sentence: string): void {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return;
+export async function dbGetSummary(userId: number, familyId: number): Promise<string> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT sentences FROM summary WHERE user_id = $1 AND family_id = $2',
+    [userId, familyId]
+  );
+
+  if (!result.rows[0]) return "";
+
+  const sentences = result.rows[0].sentences;
+  const arr = typeof sentences === 'string' ? JSON.parse(sentences) : sentences;
+  return Array.isArray(arr) ? arr.join("\n") : "";
+}
+
+export async function dbSetSummary(userId: number, familyId: number, fullSummary: string): Promise<void> {
+  const pool = getPool();
+  const text = fullSummary.trim().slice(0, 2000);
+  await pool.query(
+    `INSERT INTO summary (user_id, family_id, sentences, created_at, updated_at)
+     VALUES ($1, $2, $3, NOW(), NOW())
+     ON CONFLICT (user_id, family_id)
+     DO UPDATE SET sentences = $3, updated_at = NOW()`,
+    [userId, familyId, JSON.stringify([text])]
+  );
+}
+
+export async function dbAppendSummarySentence(userId: number, familyId: number, sentence: string): Promise<void> {
+  const pool = getPool();
   const s = sentence.trim();
   if (!s) return;
-  const row = database.query("SELECT sentences FROM summary WHERE user_id = ?").get(userId) as { sentences: string } | undefined;
-  const sentences: string[] = row ? (JSON.parse(row.sentences) as string[]) : [];
-  sentences.push(s);
-  const trimmed = sentences.length > MAX_SUMMARY_SENTENCES ? sentences.slice(-MAX_SUMMARY_SENTENCES) : sentences;
-  database.run("INSERT INTO summary (user_id, sentences) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET sentences = ?", [userId, JSON.stringify(trimmed), JSON.stringify(trimmed)]);
-}
 
-export function dbGetSummary(owner: string): string {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return "";
-  const row = database.query("SELECT sentences FROM summary WHERE user_id = ?").get(userId) as { sentences: string } | undefined;
-  if (!row) return "";
-  try {
-    const sentences = JSON.parse(row.sentences) as string[];
-    return Array.isArray(sentences) ? sentences.join("\n") : "";
-  } catch {
-    return "";
+  const result = await pool.query(
+    'SELECT sentences FROM summary WHERE user_id = $1 AND family_id = $2',
+    [userId, familyId]
+  );
+
+  let sentences: string[] = [];
+  if (result.rows[0]) {
+    const raw = result.rows[0].sentences;
+    sentences = typeof raw === 'string' ? JSON.parse(raw) : raw;
   }
+
+  sentences.push(s);
+  const trimmed = sentences.length > 50 ? sentences.slice(-50) : sentences;
+
+  await pool.query(
+    `INSERT INTO summary (user_id, family_id, sentences, created_at, updated_at)
+     VALUES ($1, $2, $3, NOW(), NOW())
+     ON CONFLICT (user_id, family_id)
+     DO UPDATE SET sentences = $3, updated_at = NOW()`,
+    [userId, familyId, JSON.stringify(trimmed)]
+  );
 }
 
-/** Replace the full summary with a single string (used by prompt-driven summary step). Max 2000 chars. */
-export function dbSetSummary(owner: string, fullSummary: string): void {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return;
-  const text = fullSummary.trim().slice(0, 2000);
-  database.run("INSERT INTO summary (user_id, sentences) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET sentences = ?", [
-    userId,
-    JSON.stringify([text]),
-    JSON.stringify([text]),
-  ]);
+// ============================================================================
+// PERSONALITY
+// ============================================================================
+
+export async function dbGetPersonality(userId: number, familyId: number): Promise<string> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT instructions FROM user_personalities WHERE user_id = $1 AND family_id = $2',
+    [userId, familyId]
+  );
+
+  if (!result.rows[0]) return "";
+
+  const instructions = result.rows[0].instructions;
+  const arr = typeof instructions === 'string' ? JSON.parse(instructions) : instructions;
+  return Array.isArray(arr) ? arr.join(". ") : "";
 }
 
-// --- Personality ---
-const MAX_PERSONALITY_INSTRUCTIONS = 20;
-
-export function dbAppendPersonalityInstruction(owner: string, instruction: string): void {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return;
+export async function dbAppendPersonalityInstruction(userId: number, familyId: number, instruction: string): Promise<void> {
+  const pool = getPool();
   const raw = instruction.trim();
   if (!raw) return;
-  const toAdd = raw.includes(". ") ? raw.split(/.\.\s+/).map((s) => s.trim()).filter(Boolean) : [raw];
-  const row = database.query("SELECT instructions FROM personality WHERE user_id = ?").get(userId) as { instructions: string } | undefined;
-  const instructions: string[] = row ? (JSON.parse(row.instructions) as string[]) : [];
+
+  const toAdd = raw.includes(". ") ? raw.split(/\.\s+/).map(s => s.trim()).filter(Boolean) : [raw];
+
+  const result = await pool.query(
+    'SELECT instructions FROM user_personalities WHERE user_id = $1 AND family_id = $2',
+    [userId, familyId]
+  );
+
+  let instructions: string[] = [];
+  if (result.rows[0]) {
+    const raw = result.rows[0].instructions;
+    instructions = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  }
+
   let changed = false;
   for (const s of toAdd) {
     if (s && !instructions.includes(s)) {
@@ -1393,342 +370,208 @@ export function dbAppendPersonalityInstruction(owner: string, instruction: strin
       changed = true;
     }
   }
+
   if (!changed) return;
-  const trimmed = instructions.length > MAX_PERSONALITY_INSTRUCTIONS ? instructions.slice(-MAX_PERSONALITY_INSTRUCTIONS) : instructions;
-  database.run("INSERT INTO personality (user_id, instructions) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET instructions = ?", [userId, JSON.stringify(trimmed), JSON.stringify(trimmed)]);
-}
 
-export function dbGetPersonality(owner: string): string {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return "";
-  const row = database.query("SELECT instructions FROM personality WHERE user_id = ?").get(userId) as { instructions: string } | undefined;
-  if (!row) return "";
-  try {
-    const arr = JSON.parse(row.instructions) as string[];
-    return Array.isArray(arr) ? arr.join(". ") : "";
-  } catch {
-    return "";
-  }
-}
+  const trimmed = instructions.length > 20 ? instructions.slice(-20) : instructions;
 
-// --- Todos ---
-export type TodoRow = { id: number; text: string; done: number; createdAt: string; creator_user_id: number | null };
-
-export function dbGetTodos(owner: string, opts?: { includeDone?: boolean }): TodoRow[] {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return [];
-  const includeDone = opts?.includeDone === true;
-  const where = includeDone ? "user_id = ?" : "user_id = ? AND done = 0";
-  return database.query(
-    `SELECT id, text, done, created_at AS createdAt, creator_user_id FROM todos WHERE ${where} ORDER BY id ASC`
-  ).all(userId) as TodoRow[];
-}
-
-/** Add a todo. Returns the new todo id, or undefined if owner could not be resolved. */
-export function dbAddTodo(owner: string, text: string, creatorOwner?: string): number | undefined {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return undefined;
-  const creatorUserId = creatorOwner != null ? resolveOwnerToUserId(database, creatorOwner) : userId;
-  const now = new Date().toISOString();
-  const result = database.run(
-    "INSERT INTO todos (user_id, creator_user_id, text, done, created_at) VALUES (?, ?, ?, 0, ?)",
-    [userId, creatorUserId ?? userId, text, now]
-  ) as { lastInsertRowid?: number };
-  return result.lastInsertRowid ?? undefined;
-}
-
-export function dbGetTodoById(owner: string, id: number): TodoRow | null {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return null;
-  const row = database.query(
-    "SELECT id, text, done, created_at AS createdAt, creator_user_id FROM todos WHERE user_id = ? AND id = ?"
-  ).get(userId, id) as TodoRow | undefined;
-  return row ?? null;
-}
-
-export function dbUpdateTodoDone(owner: string, id: number): boolean {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return false;
-  const result = database.run("UPDATE todos SET done = 1 WHERE user_id = ? AND id = ?", [userId, id]);
-  return (result as { changes: number }).changes > 0;
-}
-
-export function dbDeleteTodo(owner: string, id: number): boolean {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return false;
-  const result = database.run("DELETE FROM todos WHERE user_id = ? AND id = ?", [userId, id]);
-  return (result as { changes: number }).changes > 0;
-}
-
-export function dbUpdateTodoText(owner: string, id: number, text: string): boolean {
-  const database = getDb();
-  const userId = resolveOwnerToUserId(database, owner);
-  if (userId == null) return false;
-  const result = database.run("UPDATE todos SET text = ? WHERE user_id = ? AND id = ?", [text, userId, id]);
-  return (result as { changes: number }).changes > 0;
-}
-
-// --- Schedule state (scheduler idempotency) ---
-export type ScheduleStateRow = {
-  user_id: number;
-  last_convo_end_utc: string | null;
-  last_daily_starter_date: string | null;
-  last_4h_nudge_date: string | null;
-  last_overdue_reminder_date: string | null;
-  last_daily_todos_date: string | null;
-};
-
-export function dbGetScheduleState(userId: number): ScheduleStateRow | null {
-  const database = getDb();
-  const row = database
-    .query(
-      "SELECT user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date, last_daily_todos_date FROM schedule_state WHERE user_id = ?"
-    )
-    .get(userId) as ScheduleStateRow | undefined;
-  return row ?? null;
-}
-
-export function dbUpsertScheduleState(
-  userId: number,
-  updates: Partial<Pick<ScheduleStateRow, "last_convo_end_utc" | "last_daily_starter_date" | "last_4h_nudge_date" | "last_overdue_reminder_date" | "last_daily_todos_date">>
-): void {
-  const database = getDb();
-  const existing = dbGetScheduleState(userId);
-  if (!existing) {
-    database.run(
-      "INSERT INTO schedule_state (user_id, last_convo_end_utc, last_daily_starter_date, last_4h_nudge_date, last_overdue_reminder_date, last_daily_todos_date) VALUES (?, ?, ?, ?, ?, ?)",
-      [
-        userId,
-        updates.last_convo_end_utc ?? null,
-        updates.last_daily_starter_date ?? null,
-        updates.last_4h_nudge_date ?? null,
-        updates.last_overdue_reminder_date ?? null,
-        updates.last_daily_todos_date ?? null,
-      ]
-    );
-    return;
-  }
-  const setParts: string[] = [];
-  const values: unknown[] = [];
-  if (updates.last_convo_end_utc !== undefined) {
-    setParts.push("last_convo_end_utc = ?");
-    values.push(updates.last_convo_end_utc);
-  }
-  if (updates.last_daily_starter_date !== undefined) {
-    setParts.push("last_daily_starter_date = ?");
-    values.push(updates.last_daily_starter_date);
-  }
-  if (updates.last_4h_nudge_date !== undefined) {
-    setParts.push("last_4h_nudge_date = ?");
-    values.push(updates.last_4h_nudge_date);
-  }
-  if (updates.last_overdue_reminder_date !== undefined) {
-    setParts.push("last_overdue_reminder_date = ?");
-    values.push(updates.last_overdue_reminder_date);
-  }
-  if (updates.last_daily_todos_date !== undefined) {
-    setParts.push("last_daily_todos_date = ?");
-    values.push(updates.last_daily_todos_date);
-  }
-  if (setParts.length === 0) return;
-  values.push(userId);
-  database.run(`UPDATE schedule_state SET ${setParts.join(", ")} WHERE user_id = ?`, ...values);
-}
-
-/** Update last_convo_end_utc for a user (call when reply is sent to user or they send a message). */
-export function dbUpdateLastConvoEndUtc(userId: number): void {
-  dbUpsertScheduleState(userId, { last_convo_end_utc: new Date().toISOString() });
-}
-
-/** Get IANA timezone for user; fallback to BO_DEFAULT_TZ config or env. */
-export function dbGetUserTimezone(userId: number): string {
-  const database = getDb();
-  const row = database.query("SELECT timezone_iana FROM users WHERE id = ?").get(userId) as { timezone_iana: string | null } | undefined;
-  const tz = row?.timezone_iana?.trim();
-  if (tz) return tz;
-  const configTz = dbGetConfig("default_tz")?.trim() || dbGetConfig("BO_DEFAULT_TZ")?.trim();
-  if (configTz) return configTz;
-  return process.env.BO_DEFAULT_TZ?.trim() || "America/New_York";
-}
-
-// --- Reminders (one-off and recurring; creator + recipient) ---
-export type ReminderRow = {
-  id: number;
-  creator_user_id: number;
-  recipient_user_id: number;
-  text: string;
-  kind: "one_off" | "recurring";
-  fire_at_utc: string | null;
-  recurrence: string | null;
-  next_fire_at_utc: string | null;
-  created_at: string;
-  sent_at: string | null;
-  last_fired_at: string | null;
-};
-
-export function dbAddReminder(
-  creatorUserId: number,
-  recipientUserId: number,
-  text: string,
-  kind: "one_off" | "recurring",
-  fireAtUtc: string | null,
-  recurrence: string | null,
-  nextFireAtUtc: string | null
-): number {
-  const database = getDb();
-  const now = new Date().toISOString();
-  const result = database.run(
-    "INSERT INTO reminders (creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    [creatorUserId, recipientUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc, now, null, null]
-  ) as { lastInsertRowid: number };
-  return result.lastInsertRowid;
-}
-
-export function dbGetRemindersForRecipient(recipientUserId: number): ReminderRow[] {
-  const database = getDb();
-  return database
-    .query(
-      "SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders WHERE recipient_user_id = ? ORDER BY id ASC"
-    )
-    .all(recipientUserId) as ReminderRow[];
-}
-
-export function dbGetRemindersByCreator(creatorUserId: number): ReminderRow[] {
-  const database = getDb();
-  return database
-    .query(
-      "SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders WHERE creator_user_id = ? ORDER BY id ASC"
-    )
-    .all(creatorUserId) as ReminderRow[];
-}
-
-/** Reminders where recipient is userId or created by userId. */
-export function dbGetRemindersForUser(userId: number, filter?: "for_me" | "by_me"): ReminderRow[] {
-  if (filter === "by_me") return dbGetRemindersByCreator(userId);
-  if (filter === "for_me") return dbGetRemindersForRecipient(userId);
-  const byCreator = dbGetRemindersByCreator(userId);
-  const forRecipient = dbGetRemindersForRecipient(userId);
-  const seen = new Set<number>();
-  const out: ReminderRow[] = [];
-  for (const r of forRecipient) {
-    if (!seen.has(r.id)) {
-      seen.add(r.id);
-      out.push(r);
-    }
-  }
-  for (const r of byCreator) {
-    if (!seen.has(r.id)) {
-      seen.add(r.id);
-      out.push(r);
-    }
-  }
-  out.sort((a, b) => a.id - b.id);
-  return out;
-}
-
-export function dbGetReminderById(id: number): ReminderRow | null {
-  const database = getDb();
-  const row = database
-    .query(
-      "SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders WHERE id = ?"
-    )
-    .get(id) as ReminderRow | undefined;
-  return row ?? null;
-}
-
-/** One-off: fire_at_utc <= now and sent_at IS NULL. Recurring: next_fire_at_utc <= now. */
-export function dbGetDueReminders(nowIso: string): ReminderRow[] {
-  const database = getDb();
-  const rows = database
-    .query(
-      `SELECT id, creator_user_id, recipient_user_id, text, kind, fire_at_utc, recurrence, next_fire_at_utc, created_at, sent_at, last_fired_at FROM reminders
-       WHERE (kind = 'one_off' AND fire_at_utc <= ? AND sent_at IS NULL) OR (kind = 'recurring' AND next_fire_at_utc IS NOT NULL AND next_fire_at_utc <= ?)
-       ORDER BY id ASC`
-    )
-    .all(nowIso, nowIso) as ReminderRow[];
-  return rows;
-}
-
-export function dbMarkReminderSentOneOff(id: number): void {
-  const database = getDb();
-  const now = new Date().toISOString();
-  database.run("UPDATE reminders SET sent_at = ? WHERE id = ? AND kind = 'one_off'", [now, id]);
-}
-
-export function dbAdvanceRecurringReminder(id: number, nextFireAtUtc: string): void {
-  const database = getDb();
-  const now = new Date().toISOString();
-  database.run("UPDATE reminders SET next_fire_at_utc = ?, last_fired_at = ? WHERE id = ? AND kind = 'recurring'", [nextFireAtUtc, now, id]);
-}
-
-export function dbUpdateReminder(id: number, updates: Partial<Pick<ReminderRow, "text" | "fire_at_utc" | "recurrence" | "next_fire_at_utc">>): boolean {
-  const database = getDb();
-  const setParts: string[] = [];
-  const values: unknown[] = [];
-  if (updates.text !== undefined) {
-    setParts.push("text = ?");
-    values.push(updates.text);
-  }
-  if (updates.fire_at_utc !== undefined) {
-    setParts.push("fire_at_utc = ?");
-    values.push(updates.fire_at_utc);
-  }
-  if (updates.recurrence !== undefined) {
-    setParts.push("recurrence = ?");
-    values.push(updates.recurrence);
-  }
-  if (updates.next_fire_at_utc !== undefined) {
-    setParts.push("next_fire_at_utc = ?");
-    values.push(updates.next_fire_at_utc);
-  }
-  if (setParts.length === 0) return false;
-  values.push(id);
-  const result = database.run(`UPDATE reminders SET ${setParts.join(", ")} WHERE id = ?`, ...values) as { changes: number };
-  return result.changes > 0;
-}
-
-export function dbDeleteReminder(id: number): boolean {
-  const database = getDb();
-  const result = database.run("DELETE FROM reminders WHERE id = ?", [id]) as { changes: number };
-  return result.changes > 0;
-}
-
-// --- Group Chats ---
-export function dbUpsertGroupChat(chatId: string, name: string, type: string): void {
-  const database = getDb();
-  const now = new Date().toISOString();
-  database.run(
-    `INSERT INTO group_chats (chat_id, name, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(chat_id) DO UPDATE SET name = ?, type = ?, updated_at = ?`,
-    [chatId, name, type, now, now, name, type, now]
+  await pool.query(
+    `INSERT INTO user_personalities (user_id, family_id, instructions, created_at, updated_at)
+     VALUES ($1, $2, $3, NOW(), NOW())
+     ON CONFLICT (user_id, family_id)
+     DO UPDATE SET instructions = $3, updated_at = NOW()`,
+    [userId, familyId, JSON.stringify(trimmed)]
   );
 }
 
-export function dbGetGroupChatByChatId(chatId: string): { chat_id: string; name: string; type: string } | null {
-  const database = getDb();
-  const row = database.query("SELECT chat_id, name, type FROM group_chats WHERE chat_id = ?").get(chatId) as { chat_id: string; name: string; type: string } | undefined;
-  return row ?? null;
+// ============================================================================
+// TODOS
+// ============================================================================
+
+export interface TodoRow {
+  id: number;
+  text: string;
+  done: boolean;
+  createdAt: string;
+  creator_user_id: number | null;
 }
 
-export function dbGetGroupChatByName(name: string): { chat_id: string; name: string; type: string } | null {
-  const database = getDb();
-  const nameLower = name.toLowerCase();
-  const row = database.query("SELECT chat_id, name, type FROM group_chats WHERE LOWER(name) = ?").get(nameLower) as { chat_id: string; name: string; type: string } | undefined;
-  return row ?? null;
+export async function dbGetTodos(userId: number, familyId: number, opts?: { includeDone?: boolean }): Promise<TodoRow[]> {
+  const pool = getPool();
+  const includeDone = opts?.includeDone === true;
+  
+  const query = includeDone
+    ? 'SELECT id, text, done, created_at AS "createdAt", creator_user_id FROM todos WHERE user_id = $1 AND family_id = $2 ORDER BY id ASC'
+    : 'SELECT id, text, done, created_at AS "createdAt", creator_user_id FROM todos WHERE user_id = $1 AND family_id = $2 AND done = false ORDER BY id ASC';
+
+  const result = await pool.query(query, [userId, familyId]);
+  return result.rows;
 }
 
-export function dbGetAllGroupChats(): Array<{ chat_id: string; name: string; type: string }> {
-  const database = getDb();
-  return database.query("SELECT chat_id, name, type FROM group_chats ORDER BY name").all() as Array<{ chat_id: string; name: string; type: string }>;
+export async function dbAddTodo(userId: number, familyId: number, text: string, creatorUserId?: number): Promise<number | undefined> {
+  const pool = getPool();
+  const result = await pool.query(
+    `INSERT INTO todos (user_id, family_id, creator_user_id, text, done, created_at)
+     VALUES ($1, $2, $3, $4, false, NOW())
+     RETURNING id`,
+    [userId, familyId, creatorUserId || userId, text]
+  );
+  return result.rows[0]?.id;
 }
 
-/** Check if user can modify reminder: creator or recipient. */
-export function dbCanUserModifyReminder(userId: number, reminder: ReminderRow): boolean {
-  return reminder.creator_user_id === userId || reminder.recipient_user_id === userId;
+export async function dbUpdateTodoDone(userId: number, familyId: number, id: number): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE todos SET done = true WHERE user_id = $1 AND family_id = $2 AND id = $3',
+    [userId, familyId, id]
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+export async function dbDeleteTodo(userId: number, familyId: number, id: number): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    'DELETE FROM todos WHERE user_id = $1 AND family_id = $2 AND id = $3',
+    [userId, familyId, id]
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+export async function dbUpdateTodoText(userId: number, familyId: number, id: number, text: string): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE todos SET text = $1 WHERE user_id = $2 AND family_id = $3 AND id = $4',
+    [text, userId, familyId, id]
+  );
+  return (result.rowCount || 0) > 0;
+}
+
+// ============================================================================
+// LLM LOG
+// ============================================================================
+
+export async function dbInsertLlmLog(
+  requestId: string,
+  userId: number | null,
+  familyId: number | null,
+  step: string,
+  requestDoc: unknown,
+  responseText: string
+): Promise<void> {
+  const pool = getPool();
+  const request_doc = typeof requestDoc === 'string' ? requestDoc : JSON.stringify(requestDoc);
+  
+  await pool.query(
+    `INSERT INTO llm_log (request_id, user_id, family_id, owner, step, request_doc, response_text, created_at)
+     VALUES ($1, $2, $3, 'default', $4, $5, $6, NOW())`,
+    [requestId, userId, familyId, step, request_doc, responseText || ""]
+  );
+}
+
+// ============================================================================
+// MODERATION FLAGS
+// ============================================================================
+
+export async function dbLogModerationFlag(data: {
+  userId: number;
+  familyId: number;
+  message: string;
+  originalResponse?: string;
+  replacementResponse?: string;
+  flags: Record<string, any>;
+  action: 'blocked' | 'replaced' | 'flagged';
+}): Promise<number> {
+  const pool = getPool();
+  const result = await pool.query(
+    `INSERT INTO moderation_flags (user_id, family_id, message, original_response, replacement_response, flags, action, reviewed, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW())
+     RETURNING id`,
+    [
+      data.userId,
+      data.familyId,
+      data.message,
+      data.originalResponse || null,
+      data.replacementResponse || null,
+      JSON.stringify(data.flags),
+      data.action
+    ]
+  );
+  return result.rows[0].id;
+}
+
+// ============================================================================
+// RATE LIMITING
+// ============================================================================
+
+export async function dbLogRateLimitViolation(data: {
+  familyId: number;
+  userId?: number;
+  messageCount: number;
+  windowStart: Date;
+  windowEnd: Date;
+  cooldownUntil?: Date;
+  cooldownLevel: number;
+}): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO rate_limit_log (family_id, user_id, message_count, window_start, window_end, cooldown_until, cooldown_level, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`,
+    [
+      data.familyId,
+      data.userId || null,
+      data.messageCount,
+      data.windowStart,
+      data.windowEnd,
+      data.cooldownUntil || null,
+      data.cooldownLevel
+    ]
+  );
+}
+
+// ============================================================================
+// CONFIG
+// ============================================================================
+
+export async function dbGetConfig(key: string): Promise<string | undefined> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT value FROM config WHERE key = $1',
+    [key]
+  );
+  return result.rows[0]?.value;
+}
+
+export async function dbSetConfig(key: string, value: string): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO config (key, value)
+     VALUES ($1, $2)
+     ON CONFLICT (key)
+     DO UPDATE SET value = $2`,
+    [key, value]
+  );
+}
+
+// ============================================================================
+// SCHEDULE STATE
+// ============================================================================
+
+export async function dbUpdateLastConvoEndUtc(userId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query(
+    `INSERT INTO schedule_state (user_id, last_convo_end_utc)
+     VALUES ($1, NOW())
+     ON CONFLICT (user_id)
+     DO UPDATE SET last_convo_end_utc = NOW()`,
+    [userId]
+  );
+}
+
+export async function dbGetUserTimezone(userId: number): Promise<string> {
+  const pool = getPool();
+  const result = await pool.query(
+    'SELECT timezone_iana FROM users WHERE id = $1',
+    [userId]
+  );
+  return result.rows[0]?.timezone_iana || "America/New_York";
 }
