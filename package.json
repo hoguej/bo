@@ -18,7 +18,7 @@
     "test": "bun test",
     "dev": "next dev",
     "build": "next build",
-    "start:next": "next start -p ${PORT:-3000} -H 0.0.0.0",
+    "start:next": "next start -H 0.0.0.0",
     "migrate:create": "node-pg-migrate create",
     "migrate:up": "node-pg-migrate up",
     "migrate:down": "node-pg-migrate down",
