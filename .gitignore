@@ -82,6 +82,9 @@ coverage/
 out/
 *.tsbuildinfo
 
+# Dev seed (exported from prod; contains anonymized data)
+data/seed-dev.json
+
 # Misc
 *.bak
 *.tmp

@@ -106,12 +106,12 @@ function writeOutput(response: string): void {
 
 function resolveRecipientUserId(forContact: string | undefined, requestorOwner: string): number {
   if (!forContact?.trim()) {
-    const uid = dbResolveOwnerToUserId(requestorOwner);
-    return uid ?? dbResolveOwnerToUserId("default")!;
+    const uid = await dbResolveOwnerToUserId(requestorOwner);
+    return uid ?? await dbResolveOwnerToUserId("default")!;
   }
-  const num = resolveContactToNumber(forContact.trim());
-  if (!num) return dbResolveOwnerToUserId(requestorOwner)!;
-  const uid = dbResolveOwnerToUserId(num);
+  const num = await resolveContactToNumber(forContact.trim());
+  if (!num) return await dbResolveOwnerToUserId(requestorOwner)!;
+  const uid = await dbResolveOwnerToUserId(num);
   return uid ?? dbResolveOwnerToUserId(requestorOwner)!;
 }
 
@@ -156,7 +156,7 @@ async function main() {
     process.exit(0);
   }
 
-  const numberToName = getNumberToName();
+  const numberToName = await getNumberToName();
 
   if (action === "list") {
     // List reminders for multiple contacts
@@ -171,7 +171,7 @@ async function main() {
           sections.push(`${trimmed}: I don't know who that is.`);
           continue;
         }
-        const contactUserId = dbResolveOwnerToUserId(num);
+        const contactUserId = await dbResolveOwnerToUserId(num);
         if (!contactUserId) {
           sections.push(`${trimmed}: Couldn't find them in the system.`);
           continue;
@@ -182,9 +182,11 @@ async function main() {
         if (reminders.length === 0) {
           sections.push(`${contactDisplayName}: No reminders`);
         } else {
-          const lines = reminders.map((r) => {
-            const creator = dbGetUserById(r.creator_user_id);
+          const lines = [];
+          for (const r of reminders) {
+            const creator = await dbGetUserById(r.creator_user_id);
             const creatorName = getUserDisplayName(creator, numberToName);
+            lines.push(`${r.id}. ${r.text} (${r.fire_at_utc}, by ${creatorName})`);
             const recipientTz = dbGetUserTimezone(r.recipient_user_id);
             return "  " + formatReminderForDisplay(r, creatorName, contactDisplayName, recipientTz);
           });
@@ -198,29 +200,30 @@ async function main() {
     // List reminders for a specific contact
     const forContact = (input.for_contact ?? "").trim();
     if (forContact) {
-      const num = resolveContactToNumber(forContact);
+      const num = await resolveContactToNumber(forContact);
       if (!num) {
         writeOutput(`I don't know who ${forContact} is.`);
         process.exit(0);
       }
-      const contactUserId = dbResolveOwnerToUserId(num);
+      const contactUserId = await dbResolveOwnerToUserId(num);
       if (!contactUserId) {
         writeOutput(`Couldn't find ${forContact} in the system.`);
         process.exit(0);
       }
-      const reminders = dbGetRemindersForUser(contactUserId, "for_me");
+      const reminders = await dbGetRemindersForUser(contactUserId, "for_me");
       if (reminders.length === 0) {
         writeOutput(`${forContact} has no reminders.`);
         process.exit(0);
       }
-      const contactUser = dbGetUserById(contactUserId);
+      const contactUser = await dbGetUserById(contactUserId);
       const contactDisplayName = getUserDisplayName(contactUser, numberToName, forContact);
-      const lines = reminders.map((r) => {
-        const creator = dbGetUserById(r.creator_user_id);
+      const lines = [];
+      for (const r of reminders) {
+        const creator = await dbGetUserById(r.creator_user_id);
         const creatorName = getUserDisplayName(creator, numberToName);
-        const recipientTz = dbGetUserTimezone(r.recipient_user_id);
-        return formatReminderForDisplay(r, creatorName, contactDisplayName, recipientTz);
-      });
+        const recipientTz = await dbGetUserTimezone(r.recipient_user_id);
+        lines.push(formatReminderForDisplay(r, creatorName, contactDisplayName, recipientTz));
+      }
       writeOutput(`${contactDisplayName}'s reminders:\n` + lines.join("\n"));
       process.exit(0);
     }
@@ -286,12 +289,12 @@ async function main() {
 
       const created: Array<{ name: string; id: number }> = [];
       for (const contactName of forContacts) {
-        const num = resolveContactToNumber(contactName.trim());
+        const num = await resolveContactToNumber(contactName.trim());
         if (num) {
-          const recUserId = dbResolveOwnerToUserId(num);
+          const recUserId = await dbResolveOwnerToUserId(num);
           if (recUserId != null) {
-            const id = dbAddReminder(creatorUserId, recUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc);
-            const recipient = dbGetUserById(recUserId);
+            const id = await dbAddReminder(creatorUserId, recUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc);
+            const recipient = await dbGetUserById(recUserId);
             const recipientName = getUserDisplayName(recipient, numberToName, contactName.trim());
             created.push({ name: recipientName, id });
           }
@@ -338,8 +341,8 @@ async function main() {
       writeOutput("For a recurring reminder, provide fire_at_iso for the first run and recurrence (e.g. daily 08:30).");
       process.exit(0);
     }
-    const id = dbAddReminder(creatorUserId, recipientUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc);
-    const recipient = dbGetUserById(recipientUserId);
+    const id = await dbAddReminder(creatorUserId, recipientUserId, text, kind, fireAtUtc, recurrence, nextFireAtUtc);
+    const recipient = await dbGetUserById(recipientUserId);
     const recipientName = getUserDisplayName(recipient, numberToName, "you");
     const when = fireAtUtc ? formatUtcInTz(fireAtUtc, tz) : (recurrence || "—");
     writeOutput(`Reminder #${id} set for ${recipientName} at ${when}: "${text}".`);

@@ -118,7 +118,7 @@ git add .
 git commit -m "Add Railway deployment configuration"
 git push origin main
 
-# Railway auto-deploys on push
+# Railway deploys from `prod` branch (explicit deploys; see docs/deploy-from-prod-branch.md)
 # Monitor deployment in Railway dashboard
 ```
 

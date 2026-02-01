@@ -1,0 +1,29 @@
+---
+description: Git workflow - main is dev; prod is deploy. Agent never touches prod.
+alwaysApply: true
+---
+
+# Git Workflow Rules
+
+## Branches: main (dev) vs prod (deploy)
+
+- **main** = development. Push to `main` freely; it does **not** deploy production.
+- **prod** = production. Railway deploys from `prod`. Only the **user** merges to prod and deploys.
+
+## What the agent may do
+
+✅ **Allowed:**
+- Commit locally and push to `main` (e.g. after fixes or features).
+- Create branches, merge to `main`, push `main`.
+
+## What the agent must never do
+
+❌ **Never merge to `prod`, never push to `prod`, never checkout `prod` for the purpose of deploying.**
+
+- The point of the prod branch is to avoid broken code reaching production. **You** decide when to merge main → prod and push; the agent must not do it.
+- Do not run deploy steps, suggest "I can deploy for you", or run commands that update `prod`, even if the user says "deploy". Instead, remind them that they merge to prod and push themselves.
+
+## Summary
+
+- Agent: commits and pushes to `main` only.
+- User: merges `main` into `prod` and pushes `prod` when ready to deploy.

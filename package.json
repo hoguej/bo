@@ -22,7 +22,9 @@
     "migrate:create": "node-pg-migrate create",
     "migrate:up": "node-pg-migrate up",
     "migrate:down": "node-pg-migrate down",
-    "migrate:sqlite-to-pg": "bun run scripts/migrate-sqlite-to-pg.ts"
+    "migrate:sqlite-to-pg": "bun run scripts/migrate-sqlite-to-pg.ts",
+    "seed:export": "bun run scripts/seed-export.ts",
+    "seed:import": "bun run scripts/seed-import.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",

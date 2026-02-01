@@ -37,36 +37,38 @@ type Input = {
   match_phrase?: string;
 };
 
-function loadTodos(owner: string, opts?: { includeDone?: boolean }): Todo[] {
-  const rows = dbGetTodos(owner, opts);
-  const numberToName = getNumberToName();
-  return rows.map((r) => {
+async function loadTodos(owner: string, opts?: { includeDone?: boolean }): Promise<Todo[]> {
+  const rows = await dbGetTodos(owner, opts);
+  const numberToName = await getNumberToName();
+  const todos: Todo[] = [];
+  for (const r of rows) {
     let creatorDisplayName = "—";
     if (r.creator_user_id != null) {
-      const u = dbGetUserById(r.creator_user_id);
+      const u = await dbGetUserById(r.creator_user_id);
       if (u) {
         const name = (u.first_name + " " + u.last_name).trim();
         const contactName = numberToName.get(u.phone_number);
         creatorDisplayName = contactName ?? (name.trim() ? name : u.phone_number) ?? "—";
       }
     }
-    return {
+    todos.push({
       id: r.id,
       text: r.text,
       done: r.done !== 0,
       createdAt: r.createdAt,
       creatorDisplayName,
-    };
-  });
+    });
+  }
+  return todos;
 }
 
-function resolveOwner(input: Input): { owner: string; displayName: string } {
+async function resolveOwner(input: Input): Promise<{ owner: string; displayName: string }> {
   const fromRaw = process.env.BO_REQUEST_FROM ?? "";
-  const numberToName = getNumberToName();
+  const numberToName = await getNumberToName();
 
   // for_contact = assignee (whose list). Resolve by full name or first name (e.g. "Robert" → Robert Hogue's number).
   if (input.for_contact && input.for_contact.trim()) {
-    const num = resolveContactToNumber(input.for_contact.trim());
+    const num = await resolveContactToNumber(input.for_contact.trim());
     if (num) {
       const displayName = numberToName.get(num) ?? input.for_contact.trim();
       return { owner: num, displayName };
@@ -160,10 +162,10 @@ async function main() {
     const creatorOwner = fromRaw ? requestorOwner : undefined;
     const recipients: Array<{ name: string; id?: number }> = [];
     for (const contactName of input.for_contacts) {
-      const num = resolveContactToNumber(contactName.trim());
+      const num = await resolveContactToNumber(contactName.trim());
       if (num) {
-        const id = dbAddTodo(num, text, creatorOwner);
-        const displayName = getNumberToName().get(num) ?? contactName.trim();
+        const id = await dbAddTodo(num, text, creatorOwner);
+        const displayName = (await getNumberToName()).get(num) ?? contactName.trim();
         recipients.push({ name: displayName, id });
       }
     }
@@ -225,7 +227,7 @@ async function main() {
 
     case "list": {
       const includeDone = input.show_done === true;
-      const todos = loadTodos(owner, { includeDone });
+      const todos = await loadTodos(owner, { includeDone });
       const out = formatTodoList(todos, displayName);
       const todoIds = todos.map((t) => t.id);
       const isScheduledDailyTodos = process.env.BO_SCHEDULED_DAILY_TODOS === "1";
@@ -252,7 +254,7 @@ async function main() {
     }
 
     case "remove": {
-      const todos = loadTodos(owner, { includeDone: true });
+      const todos = await loadTodos(owner, { includeDone: true });
       const id = resolveTodoNumber(input, todos, isOwnList);
       if (id == null) {
         const msg = isOwnList
@@ -275,7 +277,7 @@ async function main() {
         process.stderr.write("todo skill: edit requires text (new content)\n");
         process.exit(1);
       }
-      const todos = loadTodos(owner, { includeDone: true });
+      const todos = await loadTodos(owner, { includeDone: true });
       const id = resolveTodoNumber(input, todos, isOwnList);
       if (id == null) {
         const msg = isOwnList

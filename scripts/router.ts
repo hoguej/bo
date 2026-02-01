@@ -464,14 +464,14 @@ async function main() {
   const allowedSkillIds = await getAllowedSkillIdsForOwner(accessOwner, allSkillIds);
   const allowedSkills = registry.skills.filter((s) => allowedSkillIds.includes(s.id));
 
-  const nameToNumber = getNameToNumber();
-  const numberToName = getNumberToName();
+  const nameToNumber = await getNameToNumber();
+  const numberToName = await getNumberToName();
   // Short-circuit: "send Carrie the weather for tomorrow" → run weather skill, send to Carrie, reply "Okay, sent the weather to Carrie." (no LLM choice)
   const sendMatch = userMessage.trim().match(/^\s*send\s+(\w+)\s+(.+)$/is);
   if (sendMatch && nameToNumber.size > 0) {
     const contactInput = sendMatch[1].trim();
     const rest = sendMatch[2].trim().toLowerCase();
-    const sendToNumber = resolveContactToNumber(contactInput);
+    const sendToNumber = await resolveContactToNumber(contactInput);
     if (sendToNumber) {
       const fullName = numberToName.get(sendToNumber);
       const contactDisplay = fullName ? fullName.split(/\s+/)[0] : contactInput.charAt(0).toUpperCase() + contactInput.slice(1).toLowerCase();
@@ -526,7 +526,7 @@ async function main() {
   // For scheduled reminders we still allow todo list (only block creating todos); daily_todos uses "[scheduled: daily_todos]" so isScheduledReminder is false.
   const skillsForDecision = allowedSkills;
   const skillsSummary = skillsForDecision.map((s) => ({ id: s.id, name: s.name, description: s.description, inputSchema: s.inputSchema }));
-  const contactsList = getContactsList();
+  const contactsList = await getContactsList();
   const contactNames = contactsList.length > 0 ? contactsList.map((c) => c.name).join(", ") : "(none)";
 
   const openai = new OpenAI({ apiKey, baseURL: "https://ai-gateway.vercel.sh/v1" });
@@ -663,7 +663,7 @@ async function main() {
 
     // Determine sender name from owner
     let from: string;
-    const numberToName = getNumberToName();
+    const numberToName = await getNumberToName();
     if (owner.startsWith("telegram:")) {
       const tid = owner.slice(9).trim();
       const uid = tid ? await dbGetUserIdByTelegramId(tid) : undefined;
@@ -684,7 +684,7 @@ async function main() {
     const recipientPrompt = loadPrompt("skills/send_to_contact_recipient") || "Generate a message to the recipient. The message must say who it is from. Return plain text only.";
     const sent: string[] = [];
     for (const recipientName of recipients) {
-      const sendToNumber = resolveContactToNumber(recipientName.trim());
+      const sendToNumber = await resolveContactToNumber(recipientName.trim());
       if (!sendToNumber || sendToNumber.length < 10) {
         logErr(`send_to_contact: can't resolve ${recipientName}`);
         continue;
@@ -707,7 +707,7 @@ async function main() {
       const sendBodyRaw = await callLlmWithPrompt(openai, model, requestId + "_send_" + sendToNumber.slice(-4), recipientOwner, "send_to_contact_recipient", recipientPrompt, recipientUser, 0.3);
       const sendBody = sendBodyRaw.trim().length > 2000 ? sendBodyRaw.trim().slice(0, 1997) + "..." : sendBodyRaw.trim() || `${from} says: (no message)`;
       const sendToTelegramId = await dbGetTelegramIdByPhone(sendToNumber);
-      const displayName = getNumberToName().get(sendToNumber) ?? recipientName.trim();
+      const displayName = (await getNumberToName()).get(sendToNumber) ?? recipientName.trim();
       sent.push({ number: sendToNumber, name: displayName.split(/\s+/)[0] ?? displayName, body: sendBody, telegramId: sendToTelegramId });
     }
 
@@ -872,7 +872,7 @@ async function main() {
       const forContacts = Array.isArray((skillHints as Record<string, unknown>).for_contacts) ? ((skillHints as Record<string, unknown>).for_contacts as string[]) : undefined;
       const recipients = forContacts && forContacts.length > 0 ? forContacts : (forContact ? [forContact] : []);
       if (recipients.length > 0) {
-        const numberToName = getNumberToName();
+        const numberToName = await getNumberToName();
         let senderName: string;
         if (owner.startsWith("telegram:")) {
           const tid = owner.slice(9).trim();
@@ -906,7 +906,7 @@ async function main() {
         
         const notifications: Array<{ number: string; body: string; telegramId?: string }> = [];
         for (const contactName of recipients) {
-          const sendToNumber = resolveContactToNumber(contactName.trim());
+          const sendToNumber = await resolveContactToNumber(contactName.trim());
           if (sendToNumber) {
             const recipientOwner = sendToNumber;
             const recipientMemoryPath = getMemoryPathForOwner(recipientOwner);
@@ -971,7 +971,7 @@ async function main() {
         const recentAfter = await getRecentMessages(owner, Math.min(getMaxConversationMessages(), 10));
         const summaryUser = ["current_summary:", currentSummary || "(none)", "", "recent_conversations:", formatConversationForPrompt(recentAfter)].join("\n");
         const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);
-        const newSummary = summaryRaw.trim().slice(0, 2000);
+        const newSummary = summaryRaw?.trim().slice(0, 2000);
         if (newSummary) await setSummaryForPrompt(owner, newSummary);
       } catch (e) {
         console.error("[bo router] Summary step error:", e instanceof Error ? e.message : String(e));
