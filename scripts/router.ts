@@ -377,12 +377,12 @@ async function createResponseStep(
   extraContext: Record<string, string> = {}
 ): Promise<string> {
   const systemContent = loadPrompt("create_response") || "You are Bo. Return a single reply string to the user. Be concise and friendly.";
-  const personalityBlock = getPersonalityForPrompt(owner);
-  const summaryBlock = getSummaryForPrompt(owner);
-  const facts = getRelevantFacts(userMessage, { max: 12, path: memoryPath });
+  const personalityBlock = await getPersonalityForPrompt(owner);
+  const summaryBlock = await getSummaryForPrompt(owner);
+  const facts = await getRelevantFacts(userMessage, { max: 12, path: memoryPath });
   const factsBlock = formatFactsForPrompt(facts);
   const maxMessages = getMaxConversationMessages();
-  const recentMessages = getRecentMessages(owner, maxMessages - 1);
+  const recentMessages = await getRecentMessages(owner, maxMessages - 1);
   const conversationBlock = formatConversationForPrompt(recentMessages);
   const hintsStr = typeof hints === "string" ? hints : JSON.stringify(hints);
   const extraBlocks = Object.entries(extraContext)
@@ -500,13 +500,13 @@ async function main() {
 
   // Context for pipeline steps
   const askingAboutMe = /what do you know|what (info|facts?) do you have|what do you have on me|tell me what you know about me|list (what you know|your facts)/i.test(userMessage);
-  const facts = askingAboutMe ? getAllFacts({ path: memoryPath }) : getRelevantFacts(userMessage, { max: 12, path: memoryPath });
+  const facts = askingAboutMe ? await getAllFacts({ path: memoryPath }) : await getRelevantFacts(userMessage, { max: 12, path: memoryPath });
   const factsBlock = formatFactsForPrompt(facts);
   const maxMessages = getMaxConversationMessages();
-  const recentMessages = getRecentMessages(owner, maxMessages - 1);
+  const recentMessages = await getRecentMessages(owner, maxMessages - 1);
   const conversationBlock = formatConversationForPrompt(recentMessages);
-  const summaryBlock = getSummaryForPrompt(owner);
-  const personalityBlock = getPersonalityForPrompt(owner);
+  const summaryBlock = await getSummaryForPrompt(owner);
+  const personalityBlock = await getPersonalityForPrompt(owner);
   // For scheduled reminders we still allow todo list (only block creating todos); daily_todos uses "[scheduled: daily_todos]" so isScheduledReminder is false.
   const skillsForDecision = allowedSkills;
   const skillsSummary = skillsForDecision.map((s) => ({ id: s.id, name: s.name, description: s.description, inputSchema: s.inputSchema }));
@@ -671,10 +671,10 @@ async function main() {
       }
       const recipientOwner = sendToNumber;
       const recipientMemoryPath = getMemoryPathForOwner(recipientOwner);
-      const recipientFacts = formatFactsForPrompt(getRelevantFacts(aiPrompt, { max: 12, path: recipientMemoryPath }));
-      const recipientConvo = formatConversationForPrompt(getRecentMessages(recipientOwner, maxMessages - 1));
-      const recipientSummary = getSummaryForPrompt(recipientOwner);
-      const recipientPersonality = getPersonalityForPrompt(recipientOwner);
+      const recipientFacts = formatFactsForPrompt(await getRelevantFacts(aiPrompt, { max: 12, path: recipientMemoryPath }));
+      const recipientConvo = formatConversationForPrompt(await getRecentMessages(recipientOwner, maxMessages - 1));
+      const recipientSummary = await getSummaryForPrompt(recipientOwner);
+      const recipientPersonality = await getPersonalityForPrompt(recipientOwner);
       const recipientUser = [
         "from:", from,
         "to:", recipientName.trim(),
@@ -890,10 +890,10 @@ async function main() {
           if (sendToNumber) {
             const recipientOwner = sendToNumber;
             const recipientMemoryPath = getMemoryPathForOwner(recipientOwner);
-            const recipientFacts = formatFactsForPrompt(getRelevantFacts(baseNotification, { max: 8, path: recipientMemoryPath }));
-            const recipientConvo = formatConversationForPrompt(getRecentMessages(recipientOwner, 8));
-            const recipientSummary = getSummaryForPrompt(recipientOwner);
-            const recipientPersonality = getPersonalityForPrompt(recipientOwner);
+            const recipientFacts = formatFactsForPrompt(await getRelevantFacts(baseNotification, { max: 8, path: recipientMemoryPath }));
+            const recipientConvo = formatConversationForPrompt(await getRecentMessages(recipientOwner, 8));
+            const recipientSummary = await getSummaryForPrompt(recipientOwner);
+            const recipientPersonality = await getPersonalityForPrompt(recipientOwner);
             
             const notificationPrompt = loadPrompt("create_response") || "Rephrase for the user in Bo's personality.";
             const notificationUser = [
@@ -944,8 +944,8 @@ async function main() {
   // Optional: run summary step (current_summary + recent_conversations → replace summary).
   const summaryPrompt = loadPrompt("summary");
   if (summaryPrompt) {
-    const currentSummary = getSummaryForPrompt(owner);
-    const recentAfter = getRecentMessages(owner, Math.min(maxMessages, 10));
+    const currentSummary = await getSummaryForPrompt(owner);
+    const recentAfter = await getRecentMessages(owner, Math.min(maxMessages, 10));
     const summaryUser = ["current_summary:", currentSummary || "(none)", "", "recent_conversations:", formatConversationForPrompt(recentAfter)].join("\n");
     try {
       const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);

@@ -84,7 +84,7 @@ export function appendSummarySentence(owner: string | undefined, sentence: strin
 }
 
 /** Get the running summary for prompt context (oldest first). */
-export function getSummaryForPrompt(owner: string | undefined): string {
+export function getSummaryForPrompt(owner: string | undefined): Promise<string> {
   return await dbGetSummary(normalizeOwner(owner));
 }
 
@@ -108,7 +108,7 @@ export function appendPersonalityInstruction(owner: string | undefined, instruct
 }
 
 /** Get personality instructions for this user for prompt context. */
-export function getPersonalityForPrompt(owner: string | undefined): string {
+export function getPersonalityForPrompt(owner: string | undefined): Promise<string> {
   return await dbGetPersonality(normalizeOwner(owner));
 }
 
