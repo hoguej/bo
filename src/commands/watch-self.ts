@@ -861,6 +861,20 @@ export async function runWatchSelf(_sdk: IMessageSDK, _args: string[]): Promise<
   }, SCHEDULER_INTERVAL_MS);
   console.error("[bo watch-self] Scheduler started (interval " + SCHEDULER_INTERVAL_MS / 60000 + " min).");
 
+  // Health check endpoint for Railway
+  const port = process.env.PORT || 3000;
+  const server = Bun.serve({
+    port,
+    fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/health") {
+        return new Response("OK", { status: 200 });
+      }
+      return new Response("Not Found", { status: 404 });
+    },
+  });
+  console.error(`[bo watch-self] Health check server listening on port ${port}`);
+
   // Keep process alive
   await new Promise<never>(() => {});
 }
