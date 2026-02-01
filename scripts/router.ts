@@ -531,27 +531,31 @@ async function main() {
 
   const openai = new OpenAI({ apiKey, baseURL: "https://ai-gateway.vercel.sh/v1" });
 
-  // Step 1: Fact finding
+  // Step 1: Fact finding (fire-and-forget - saves for future messages, doesn't affect current response)
   const factFindingPrompt = loadPrompt("fact_finding") || "Extract facts from the user message. Return a JSON array of { key, value, scope?, tags? }. Empty array [] if none. Only attributes about the user; no meeting/todo/request content.";
-  const factFindingUser = ["user_message:", userMessage, "", "existing_facts (context only, do not re-save):", factsBlock || "(none)"].join("\n");
-  const factFindingRaw = await callLlmWithPrompt(openai, model, requestId, owner, "fact_finding", factFindingPrompt, factFindingUser, 0.1);
-  const saveFactsJson = extractJsonArray(factFindingRaw) ?? "[]";
-  try {
-    const toSaveFacts = JSON.parse(saveFactsJson) as FactInput[];
-    if (Array.isArray(toSaveFacts)) {
-      for (const f of toSaveFacts) {
-        if (f && typeof f.key === "string" && typeof f.value === "string") {
-          if (isReservedFactKey(f.key)) continue;
-          if (String(f.key).toLowerCase() === "personality_instruction") {
-            await appendPersonalityInstruction(owner, f.value);
-          } else {
-            await upsertFact({ key: f.key, value: f.value, scope: f.scope ?? "user", tags: f.tags ?? [], path: memoryPath });
+  if (factFindingPrompt) {
+    (async () => {
+      try {
+        const factFindingUser = ["user_message:", userMessage, "", "existing_facts (context only, do not re-save):", factsBlock || "(none)"].join("\n");
+        const factFindingRaw = await callLlmWithPrompt(openai, model, requestId, owner, "fact_finding", factFindingPrompt, factFindingUser, 0.1);
+        const saveFactsJson = extractJsonArray(factFindingRaw) ?? "[]";
+        const toSaveFacts = JSON.parse(saveFactsJson) as FactInput[];
+        if (Array.isArray(toSaveFacts)) {
+          for (const f of toSaveFacts) {
+            if (f && typeof f.key === "string" && typeof f.value === "string") {
+              if (isReservedFactKey(f.key)) continue;
+              if (String(f.key).toLowerCase() === "personality_instruction") {
+                await appendPersonalityInstruction(owner, f.value);
+              } else {
+                await upsertFact({ key: f.key, value: f.value, scope: f.scope ?? "user", tags: f.tags ?? [], path: memoryPath });
+              }
+            }
           }
         }
+      } catch (e) {
+        console.error("[bo router] Fact finding error:", e instanceof Error ? e.message : String(e));
       }
-    }
-  } catch (_) {
-    /* ignore */
+    })();
   }
 
   // Step 2: What to do
