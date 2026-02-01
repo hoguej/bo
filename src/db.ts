@@ -396,7 +396,8 @@ export interface TodoRow {
   creator_user_id: number | null;
 }
 
-export async function dbGetTodos(userId: number, familyId: number, opts?: { includeDone?: boolean }): Promise<TodoRow[]> {
+// Internal: Multi-tenant version
+async function dbGetTodosInternal(userId: number, familyId: number, opts?: { includeDone?: boolean }): Promise<TodoRow[]> {
   const pool = getPool();
   const includeDone = opts?.includeDone === true;
   
@@ -406,6 +407,14 @@ export async function dbGetTodos(userId: number, familyId: number, opts?: { incl
 
   const result = await pool.query(query, [userId, familyId]);
   return result.rows;
+}
+
+// Legacy SQLite-compatible: owner (phone) instead of userId+familyId
+export async function dbGetTodos(owner: string, opts?: { includeDone?: boolean }): Promise<TodoRow[]> {
+  const userId = await dbResolveOwnerToUserId(owner);
+  if (!userId) return [];
+  // Default to family_id = 1 for now
+  return dbGetTodosInternal(userId, 1, opts);
 }
 
 export async function dbAddTodo(userId: number, familyId: number, text: string, creatorUserId?: number): Promise<number | undefined> {
@@ -602,7 +611,12 @@ export async function dbMarkMessageReplied(guid: string): Promise<void> {
 
 export async function dbResolveOwnerToUserId(owner: string): Promise<number | undefined> {
   const pool = getPool();
-  const result = await pool.query('SELECT id FROM users WHERE phone_number = $1', [owner]);
+  // Owner might be phone without + prefix, try both formats
+  const normalized = owner.startsWith('+') ? owner : `+1${owner}`;
+  const result = await pool.query(
+    'SELECT id FROM users WHERE phone_number = $1 OR phone_number = $2',
+    [owner, normalized]
+  );
   return result.rows[0]?.id;
 }
 
@@ -631,14 +645,14 @@ export async function dbGetDueReminders(nowIso: string): Promise<any[]> {
   const pool = getPool();
   const result = await pool.query(`
     SELECT * FROM reminders 
-    WHERE fire_at_utc <= $1 AND sent_at_utc IS NULL
+    WHERE fire_at_utc <= $1 AND sent_at IS NULL
   `, [nowIso]);
   return result.rows;
 }
 
 export async function dbMarkReminderSentOneOff(id: number): Promise<void> {
   const pool = getPool();
-  await pool.query('UPDATE reminders SET sent_at_utc = NOW() WHERE id = $1', [id]);
+  await pool.query('UPDATE reminders SET sent_at = NOW(), last_fired_at = NOW() WHERE id = $1', [id]);
 }
 
 export async function dbAdvanceRecurringReminder(id: number, nextFireAtUtc: string): Promise<void> {
@@ -697,4 +711,45 @@ export async function dbGetTelegramIdByPhone(phone: string): Promise<string | un
   const pool = getPool();
   const result = await pool.query('SELECT telegram_id FROM users WHERE phone_number = $1', [phone]);
   return result.rows[0]?.telegram_id;
+}
+
+// Skills registry functions
+export async function dbGetSkillsRegistry(): Promise<any[]> {
+  const pool = getPool();
+  const result = await pool.query('SELECT * FROM skills_registry ORDER BY id');
+  return result.rows;
+}
+
+export async function dbGetSkillsAccessDefault(): Promise<string[]> {
+  const pool = getPool();
+  const result = await pool.query('SELECT skill_id FROM skills_access_default');
+  return result.rows.map((r: any) => r.skill_id);
+}
+
+export async function dbGetSkillsAccessByOwner(owner: string): Promise<string[]> {
+  const userId = await dbResolveOwnerToUserId(owner);
+  if (!userId) return [];
+  const pool = getPool();
+  const result = await pool.query('SELECT skill_id FROM skills_access_by_user WHERE user_id = $1', [userId]);
+  return result.rows.map((r: any) => r.skill_id);
+}
+
+export async function dbGetSkillsAccessByNumber(): Promise<Record<string, string[]>> {
+  const pool = getPool();
+  const result = await pool.query(`
+    SELECT u.phone_number, s.skill_id 
+    FROM skills_access_by_user s
+    JOIN users u ON s.user_id = u.id
+  `);
+  const map: Record<string, string[]> = {};
+  for (const row of result.rows) {
+    if (!map[row.phone_number]) map[row.phone_number] = [];
+    map[row.phone_number].push(row.skill_id);
+  }
+  return map;
+}
+
+// Migration stub (PostgreSQL migrations handled via node-pg-migrate)
+export async function runMigration(): Promise<void> {
+  // No-op for PostgreSQL - migrations handled externally
 }

@@ -234,7 +234,7 @@ function createTelegramBot(): Bot | null {
 
     if (Date.now() - lastReplyAt < REPLY_RATE_LIMIT_MS) return;
 
-    const script = getAgentScript();
+    const script = await getAgentScript();
     if (!script) {
       await ctx.reply("Agent script not configured.");
       return;
@@ -354,7 +354,7 @@ function createTelegramBot(): Bot | null {
 
 function runAgent(message: string, ctxEnv: Record<string, string>): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    const script = getAgentScript();
+    const script = await getAgentScript();
     if (!script) {
       resolve({
         stdout: "",
@@ -726,17 +726,17 @@ const NUDGE_WINDOW_START = { hour: 9, minute: 30 };
 const NUDGE_WINDOW_END = { hour: 20, minute: 0 };
 
 async function runSchedulerTick(bot: Bot | null): Promise<void> {
-  const primaryUserIdStr = dbGetConfig("primary_user_id")?.trim();
+  const primaryUserIdStr = (await dbGetConfig("primary_user_id"))?.trim();
   if (!primaryUserIdStr) return;
   const primaryUserId = parseInt(primaryUserIdStr, 10);
   if (Number.isNaN(primaryUserId)) return;
-  const owner = dbGetOwnerByUserId(primaryUserId);
-  const tz = dbGetUserTimezone(primaryUserId);
-  const state = dbGetScheduleState(primaryUserId);
+  const owner = await dbGetOwnerByUserId(primaryUserId);
+  const tz = await dbGetUserTimezone(primaryUserId);
+  const state = await dbGetScheduleState(primaryUserId);
   const { date: todayLocal, hour, minute } = getLocalDateAndTime(tz);
   const nowIso = new Date().toISOString();
 
-  const script = getAgentScript();
+  const script = await getAgentScript();
   if (!script) return;
 
   const ctxEnv: Record<string, string> = {
@@ -771,7 +771,7 @@ async function runSchedulerTick(bot: Bot | null): Promise<void> {
     }
   }
 
-  const openTodos = dbGetTodos(owner, { includeDone: false });
+  const openTodos = await dbGetTodos(owner, { includeDone: false });
   if (
     openTodos.length > 0 &&
     isAfterDailyStarter &&
@@ -789,7 +789,7 @@ async function runSchedulerTick(bot: Bot | null): Promise<void> {
     }
   }
 
-  const dueReminders = dbGetDueReminders(nowIso);
+  const dueReminders = await dbGetDueReminders(nowIso);
   for (const rem of dueReminders) {
     const recipientOwner = dbGetOwnerByUserId(rem.recipient_user_id);
     const remCtxEnv = { ...ctxEnv, BO_REQUEST_FROM: recipientOwner };
@@ -839,7 +839,7 @@ async function sendSchedulerReply(
 }
 
 export async function runWatchSelf(_sdk: IMessageSDK, _args: string[]): Promise<void> {
-  if (!getAgentScript()) {
+  if (!await getAgentScript()) {
     console.error("Set config agent_script in admin or BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.");
     process.exit(1);
   }
