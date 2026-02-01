@@ -131,7 +131,7 @@ function logPromptResponse(
   rawResponse: string
 ): void {
   try {
-    dbInsertLlmLog(requestId, owner ?? "default", step, requestDoc, rawResponse ?? "");
+    await dbInsertLlmLog(requestId, owner ?? "default", step, requestDoc, rawResponse ?? "");
   } catch (e) {
     console.error("[bo router] Failed to write llm_log:", e instanceof Error ? e.message : String(e));
   }
@@ -216,7 +216,7 @@ function buildContext() {
     to: getEnv("BO_REQUEST_TO"),
     isSelfChat: getEnv("BO_REQUEST_IS_SELF_CHAT"),
     isFromMe: getEnv("BO_REQUEST_IS_FROM_ME"),
-    default_zip: dbGetConfig("default_zip") || getEnv("BO_DEFAULT_ZIP") || undefined,
+    default_zip: await dbGetConfig("default_zip") || getEnv("BO_DEFAULT_ZIP") || undefined,
   };
 }
 
@@ -422,7 +422,7 @@ async function main() {
     process.stdout.write(randomExcuse());
     process.exit(0);
   }
-  const model = dbGetConfig("llm_model") || getEnv("BO_LLM_MODEL") || "openai/gpt-4.1";
+  const model = await dbGetConfig("llm_model") || getEnv("BO_LLM_MODEL") || "openai/gpt-4.1";
 
   const userMessage = process.argv.slice(2).join(" ").trim();
   if (!userMessage) {
@@ -486,7 +486,7 @@ async function main() {
           if (code === 0 && stdout?.trim()) {
             const sendBody = stdout.trim().length > 2000 ? stdout.trim().slice(0, 1997) + "..." : stdout.trim();
             const replyToSender = `Okay, sent the weather to ${contactDisplay}.`;
-            const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+            const sendToTelegramId = await dbGetTelegramIdByPhone(sendToNumber);
             const payload: Record<string, string> = { sendTo: sendToNumber, sendBody, replyToSender };
             if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
             process.stdout.write(JSON.stringify(payload) + "\n");
@@ -599,9 +599,9 @@ async function main() {
       // Default: tailor to the requestor (sender).
       let firstName: string | undefined;
       if (owner.startsWith("telegram:")) {
-        const uid = dbGetUserIdByTelegramId(owner.slice(9));
+        const uid = await dbGetUserIdByTelegramId(owner.slice(9));
         if (uid != null) {
-          const u = dbGetUserById(uid);
+          const u = await dbGetUserById(uid);
           firstName = u?.first_name?.trim() || undefined;
         }
       } else {
@@ -648,7 +648,7 @@ async function main() {
       const tid = owner.slice(9).trim();
       const uid = tid ? dbGetUserIdByTelegramId(tid) : undefined;
       if (uid != null) {
-        const u = dbGetUserById(uid);
+        const u = await dbGetUserById(uid);
         const first = (u?.first_name ?? "").trim();
         const contactName = u?.phone_number ? numberToName.get(u.phone_number) : undefined;
         from = first || (contactName ? contactName.split(/\s+/)[0] : undefined) || contactName || "Bo";
@@ -686,7 +686,7 @@ async function main() {
       ].join("\n");
       const sendBodyRaw = await callLlmWithPrompt(openai, model, requestId + "_send_" + sendToNumber.slice(-4), recipientOwner, "send_to_contact_recipient", recipientPrompt, recipientUser, 0.3);
       const sendBody = sendBodyRaw.trim().length > 2000 ? sendBodyRaw.trim().slice(0, 1997) + "..." : sendBodyRaw.trim() || `${from} says: (no message)`;
-      const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+      const sendToTelegramId = await dbGetTelegramIdByPhone(sendToNumber);
       const displayName = getNumberToName().get(sendToNumber) ?? recipientName.trim();
       sent.push({ number: sendToNumber, name: displayName.split(/\s+/)[0] ?? displayName, body: sendBody, telegramId: sendToTelegramId });
     }
@@ -858,7 +858,7 @@ async function main() {
           const tid = owner.slice(9).trim();
           const uid = tid ? dbGetUserIdByTelegramId(tid) : undefined;
           if (uid != null) {
-            const u = dbGetUserById(uid);
+            const u = await dbGetUserById(uid);
             const first = (u?.first_name ?? "").trim();
             const contactName = u?.phone_number ? numberToName.get(u.phone_number) : undefined;
             senderName = first || (contactName ? contactName.split(/\s+/)[0] : undefined) || contactName || "Someone";
@@ -906,7 +906,7 @@ async function main() {
             ].join("\n");
             const personalizedRaw = await callLlmWithPrompt(openai, model, requestId + "_notif_" + sendToNumber.slice(-4), recipientOwner, "todo_notification", notificationPrompt, notificationUser, 0.3);
             const personalizedNotification = personalizedRaw.trim() || baseNotification;
-            const sendToTelegramId = dbGetTelegramIdByPhone(sendToNumber);
+            const sendToTelegramId = await dbGetTelegramIdByPhone(sendToNumber);
             notifications.push({
               number: sendToNumber,
               body: personalizedNotification.length > 2000 ? personalizedNotification.slice(0, 1997) + "..." : personalizedNotification,

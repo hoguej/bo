@@ -85,12 +85,12 @@ export function appendSummarySentence(owner: string | undefined, sentence: strin
 
 /** Get the running summary for prompt context (oldest first). */
 export function getSummaryForPrompt(owner: string | undefined): string {
-  return dbGetSummary(normalizeOwner(owner));
+  return await dbGetSummary(normalizeOwner(owner));
 }
 
 /** Replace the full summary with a single string (used by prompt-driven summary step). */
 export function setSummaryForPrompt(owner: string | undefined, fullSummary: string): void {
-  dbSetSummary(normalizeOwner(owner), fullSummary.trim());
+  await dbSetSummary(normalizeOwner(owner), fullSummary.trim());
 }
 
 /** Path for per-user personality instructions. personality_<owner>.json. */
@@ -104,12 +104,12 @@ export function getPersonalityPathForOwner(owner: string | undefined): string {
 
 /** Append one or more personality instructions. If the string contains ". " we split and append each part (LLM sometimes returns combined list). Per-user; accumulates up to MAX_PERSONALITY_INSTRUCTIONS. */
 export function appendPersonalityInstruction(owner: string | undefined, instruction: string): void {
-  dbAppendPersonalityInstruction(normalizeOwner(owner), instruction);
+  await dbAppendPersonalityInstruction(normalizeOwner(owner), instruction);
 }
 
 /** Get personality instructions for this user for prompt context. */
 export function getPersonalityForPrompt(owner: string | undefined): string {
-  return dbGetPersonality(normalizeOwner(owner));
+  return await dbGetPersonality(normalizeOwner(owner));
 }
 
 export type ConversationMessage = { role: "user" | "assistant"; content: string };
@@ -125,7 +125,7 @@ const MAX_CONVERSATION_MESSAGES = getMaxConversationMessages();
 
 /** Last N messages (oldest first) for context. */
 export function getRecentMessages(owner: string | undefined, max: number = MAX_CONVERSATION_MESSAGES): ConversationMessage[] {
-  const rows = dbGetConversation(normalizeOwner(owner), max);
+  const rows = await dbGetConversation(normalizeOwner(owner), max);
   return rows.map((r) => ({ role: r.role as "user" | "assistant", content: r.content }));
 }
 
@@ -135,7 +135,7 @@ export function appendConversation(
   userContent: string,
   assistantContent: string
 ): void {
-  dbAppendConversation(normalizeOwner(owner), userContent, assistantContent, getMaxConversationMessages());
+  await dbAppendConversation(normalizeOwner(owner), userContent, assistantContent, getMaxConversationMessages());
 }
 
 export function getMemoryPath(): string {
@@ -145,7 +145,7 @@ export function getMemoryPath(): string {
 /** Load facts from DB for the owner implied by path. Used by getRelevantFacts/getAllFacts etc. */
 export function loadMemory(path: string = getMemoryPath()): MemoryFile {
   const owner = pathToOwner(path);
-  const factRows = dbGetFacts(owner);
+  const factRows = await dbGetFacts(owner);
   const facts: Fact[] = factRows.map((r) => ({
     key: r.key,
     value: r.value,
@@ -183,7 +183,7 @@ export function upsertFact(opts: {
   const value = opts.value.trim();
   const scope: FactScope = opts.scope ?? "user";
   const tags = (opts.tags ?? []).map(normalizeTag).filter(Boolean);
-  dbUpsertFact(owner, key, value, scope, tags);
+  await dbUpsertFact(owner, key, value, scope, tags);
   const now = new Date().toISOString();
   return { key, value, scope, tags, createdAt: now, updatedAt: now };
 }
