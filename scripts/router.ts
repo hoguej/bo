@@ -506,14 +506,22 @@ async function main() {
   }
 
   // Context for pipeline steps
+  // Resolve owner to userId ONCE to avoid multiple DB calls
+  const userId = await dbResolveOwnerToUserId(owner);
+  const familyId = 1; // default family
+  
   const askingAboutMe = /what do you know|what (info|facts?) do you have|what do you have on me|tell me what you know about me|list (what you know|your facts)/i.test(userMessage);
-  const facts = askingAboutMe ? await getAllFacts({ path: memoryPath }) : await getRelevantFacts(userMessage, { max: 12, path: memoryPath });
+  
+  // Run all memory queries in parallel for speed
+  const [facts, recentMessages, summaryBlock, personalityBlock] = await Promise.all([
+    askingAboutMe ? getAllFacts({ path: memoryPath }) : getRelevantFacts(userMessage, { max: 12, path: memoryPath }),
+    getRecentMessages(owner, getMaxConversationMessages() - 1),
+    getSummaryForPrompt(owner),
+    getPersonalityForPrompt(owner)
+  ]);
+  
   const factsBlock = formatFactsForPrompt(facts);
-  const maxMessages = getMaxConversationMessages();
-  const recentMessages = await getRecentMessages(owner, maxMessages - 1);
   const conversationBlock = formatConversationForPrompt(recentMessages);
-  const summaryBlock = await getSummaryForPrompt(owner);
-  const personalityBlock = await getPersonalityForPrompt(owner);
   // For scheduled reminders we still allow todo list (only block creating todos); daily_todos uses "[scheduled: daily_todos]" so isScheduledReminder is false.
   const skillsForDecision = allowedSkills;
   const skillsSummary = skillsForDecision.map((s) => ({ id: s.id, name: s.name, description: s.description, inputSchema: s.inputSchema }));
