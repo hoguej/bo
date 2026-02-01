@@ -851,12 +851,28 @@ export async function runWatchSelf(_sdk: IMessageSDK, _args: string[]): Promise<
     process.exit(1);
   }
   
+  // Graceful shutdown handler
+  let isShuttingDown = false;
+  const shutdown = async () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.error("[bo watch-self] Shutting down gracefully...");
+    if (telegramBotInstance) {
+      await telegramBotInstance.stop();
+      console.error("[bo watch-self] Telegram bot stopped");
+    }
+    process.exit(0);
+  };
+  
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+  
   console.error("[bo watch-self] Telegram bot enabled. Send /myid to your bot to get your Telegram ID, then set users.telegram_id in admin.");
   void telegramBotInstance.start();
 
   // Run scheduler tick immediately on startup, then every interval
   void runSchedulerTick(telegramBotInstance);
-  setInterval(() => {
+  const schedulerInterval = setInterval(() => {
     void runSchedulerTick(telegramBotInstance);
   }, SCHEDULER_INTERVAL_MS);
   console.error("[bo watch-self] Scheduler started (interval " + SCHEDULER_INTERVAL_MS / 60000 + " min).");
