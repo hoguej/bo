@@ -753,3 +753,12 @@ export async function dbGetSkillsAccessByNumber(): Promise<Record<string, string
 export async function runMigration(): Promise<void> {
   // No-op for PostgreSQL - migrations handled externally
 }
+
+// Reserved fact keys that can't be user-defined
+export function isReservedFactKey(key: string): boolean {
+  const reserved = new Set([
+    'user_id', 'family_id', 'id', 'created_at', 'updated_at',
+    'phone', 'telegram_id', 'name', 'first_name', 'last_name'
+  ]);
+  return reserved.has(key.toLowerCase());
+}
