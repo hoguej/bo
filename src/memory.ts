@@ -143,8 +143,11 @@ export async function appendConversation(
   owner: string | undefined,
   userContent: string,
   assistantContent: string
-): void {
-  await dbAppendConversation(normalizeOwner(owner), userContent, assistantContent, getMaxConversationMessages());
+): Promise<void> {
+  const { dbAppendConversation, dbResolveOwnerToUserId } = await import("./db");
+  const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
+  if (!userId) return;
+  await dbAppendConversation(userId, 1, userContent, assistantContent, getMaxConversationMessages()); // default familyId = 1
 }
 
 export function getMemoryPath(): string {
