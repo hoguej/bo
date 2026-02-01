@@ -660,3 +660,41 @@ export async function dbGetGroupChatByName(name: string): Promise<any> {
   const result = await pool.query('SELECT * FROM group_chats WHERE name = $1 LIMIT 1', [name]);
   return result.rows[0] || null;
 }
+
+// Contact helper functions for watch-self
+export async function dbGetContactsNumberToName(): Promise<Map<string, string>> {
+  const pool = getPool();
+  const result = await pool.query('SELECT phone_number, first_name, last_name FROM users');
+  const map = new Map<string, string>();
+  for (const row of result.rows) {
+    const name = `${row.first_name}${row.last_name ? ' ' + row.last_name : ''}`;
+    map.set(row.phone_number, name);
+  }
+  return map;
+}
+
+export async function dbGetContactsNameToNumber(): Promise<Map<string, string>> {
+  const pool = getPool();
+  const result = await pool.query('SELECT phone_number, first_name, last_name FROM users');
+  const map = new Map<string, string>();
+  for (const row of result.rows) {
+    const name = `${row.first_name}${row.last_name ? ' ' + row.last_name : ''}`;
+    map.set(name.toLowerCase(), row.phone_number);
+  }
+  return map;
+}
+
+export async function dbGetContactsList(): Promise<Array<{ name: string; number: string }>> {
+  const pool = getPool();
+  const result = await pool.query('SELECT phone_number, first_name, last_name FROM users ORDER BY first_name');
+  return result.rows.map((row: any) => ({
+    name: `${row.first_name}${row.last_name ? ' ' + row.last_name : ''}`,
+    number: row.phone_number,
+  }));
+}
+
+export async function dbGetTelegramIdByPhone(phone: string): Promise<string | undefined> {
+  const pool = getPool();
+  const result = await pool.query('SELECT telegram_id FROM users WHERE phone_number = $1', [phone]);
+  return result.rows[0]?.telegram_id;
+}
