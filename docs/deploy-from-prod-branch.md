@@ -20,8 +20,10 @@ Deploys are **explicit**: production only updates when you merge into `prod` and
    ```
 
 2. **Configure Railway** to deploy from `prod`:
-   - Railway dashboard → your project → **Settings** (or each service → Settings).
-   - Under **Source** / **Build**, set **Branch** to `prod` (instead of `main`).
+   - Railway dashboard → your **project** → open each **service** (web, daemon, etc.) → **Settings**.
+   - Find **Source** or **Repository** / **Connected repo**.
+   - Look for **Branch** or **Trigger branch** (dropdown). Choose `prod`.
+   - If `prod` doesn’t appear: **Disconnect** the repo, then **Connect** again so Railway refetches branches. Then pick `prod`.
    - Save. Railway will deploy when `prod` is updated.
 
 ## Deploying
@@ -37,6 +39,17 @@ git checkout main
 ```
 
 Railway will build and deploy from the new `prod` tip.
+
+## Troubleshooting: "Can't set prod"
+
+- **Branch list doesn’t show prod**  
+  Make sure `prod` exists on GitHub: `git push -u origin prod`. Then in Railway: **Disconnect** the GitHub repo from the service, then **Connect** again and pick the same repo — the branch dropdown should refresh and include `prod`.
+
+- **No branch dropdown**  
+  The branch selector only appears when the service is connected to a **GitHub repo** (not a template or public URL). If you deployed from a template, connect the service to your GitHub repo in Settings → Source, then set the branch.
+
+- **Still stuck**  
+  Railway docs: [Controlling GitHub Autodeploys](https://docs.railway.com/guides/github-autodeploys). Or ask in [Railway Discord](https://discord.gg/railway) / support.
 
 ## Summary
 

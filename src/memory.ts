@@ -93,7 +93,11 @@ export async function getSummaryForPrompt(owner: string | undefined): Promise<st
 
 /** Replace the full summary with a single string (used by prompt-driven summary step). */
 export async function setSummaryForPrompt(owner: string | undefined, fullSummary: string): Promise<void> {
-  await dbSetSummary(normalizeOwner(owner), fullSummary.trim());
+  const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
+  if (!userId) return;
+  const text = typeof fullSummary === "string" ? fullSummary.trim() : "";
+  if (!text) return;
+  await dbSetSummary(userId, 1, text);
 }
 
 /** Path for per-user personality instructions. personality_<owner>.json. */

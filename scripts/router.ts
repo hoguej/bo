@@ -22,6 +22,7 @@ import {
 } from "../src/memory";
 import { getContactsList, getNameToNumber, getNumberToName, resolveContactToNumber } from "../src/contacts";
 import {
+  closeDb,
   dbGetConfig,
   dbGetTelegramIdByPhone,
   dbGetUserById,
@@ -584,6 +585,7 @@ async function main() {
     logErr("what_to_do parse failed: " + (e instanceof Error ? e.message : String(e)));
     process.stdout.write(randomExcuse());
     await appendConversation(owner, userMessage, randomExcuse());
+    await closeDb();
     return;
   }
   if (isScheduledReminder) {
@@ -971,10 +973,12 @@ async function main() {
         const recentAfter = await getRecentMessages(owner, Math.min(getMaxConversationMessages(), 10));
         const summaryUser = ["current_summary:", currentSummary || "(none)", "", "recent_conversations:", formatConversationForPrompt(recentAfter)].join("\n");
         const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);
-        const newSummary = summaryRaw?.trim().slice(0, 2000);
+        const newSummary = typeof summaryRaw === "string" ? summaryRaw.trim().slice(0, 2000) : "";
         if (newSummary) await setSummaryForPrompt(owner, newSummary);
       } catch (e) {
         console.error("[bo router] Summary step error:", e instanceof Error ? e.message : String(e));
+      } finally {
+        await closeDb();
       }
     })();
   }

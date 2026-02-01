@@ -1,0 +1,9 @@
+{
+  "responses": {
+    "fact_finding": "[]",
+    "what_to_do": "{\"skill\":\"create_a_response\"}",
+    "create_response": "Hi! How can I help?",
+    "summary": "User said hi."
+  },
+  "default": "[]"
+}

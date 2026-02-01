@@ -98,11 +98,9 @@ function telegramUnknownRateLimit(telegramId: string): boolean {
   return false;
 }
 
-const NUMBER_TO_NAME = getNumberToName();
-
-function senderDisplay(sender: string): string {
+function senderDisplay(sender: string, numberToName: Map<string, string>): string {
   const canonical = canonicalPhone(sender);
-  const name = NUMBER_TO_NAME.get(canonical);
+  const name = numberToName.get(canonical);
   return name ? `${name} (${canonical})` : sender;
 }
 
@@ -118,15 +116,13 @@ async function getAgentNumbers(): Promise<Set<string>> {
   }
   return set;
 }
-const AGENT_NUMBERS = getAgentNumbers();
-
-function isFromAgentNumber(sender: string): boolean {
-  if (AGENT_NUMBERS.size === 0) return false;
-  return AGENT_NUMBERS.has(canonicalPhone(sender));
+function isFromAgentNumber(sender: string, agentNumbers: Set<string>): boolean {
+  if (agentNumbers.size === 0) return false;
+  return agentNumbers.has(canonicalPhone(sender));
 }
 
-function isSelfChat(chatId: string): boolean {
-  const self = getSelfHandle();
+async function isSelfChat(chatId: string): Promise<boolean> {
+  const self = await getSelfHandle();
   if (!self) return false;
   return chatId === self || chatId.endsWith(self) || chatId.includes(self);
 }
@@ -384,9 +380,14 @@ async function runAgent(message: string, ctxEnv: Record<string, string>): Promis
 
 /** Process one incoming message (shared by real-time watcher and catch-up). */
 async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promise<void> {
+  const [numberToName, agentNumbers, isSelfChatResult] = await Promise.all([
+    getNumberToName(),
+    getAgentNumbers(),
+    isSelfChat(msg.chatId ?? ""),
+  ]);
   const text = (msg.text ?? "").trim();
-  const isSelf = isSelfChat(msg.chatId ?? "") && msg.isFromMe;
-  const isFromAllowed = AGENT_NUMBERS.size > 0 ? isFromAgentNumber(msg.sender ?? "") : false;
+  const isSelf = isSelfChatResult && msg.isFromMe;
+  const isFromAllowed = agentNumbers.size > 0 ? isFromAgentNumber(msg.sender ?? "", agentNumbers) : false;
 
   let passToAgent: boolean;
   let why: string;
@@ -433,7 +434,7 @@ async function handleIncomingMessage(msg: MessageLike, sdk: IMessageSDK): Promis
     [
       "---",
       `To: ${msg.chatId}`,
-      `From: ${senderDisplay(msg.sender ?? "")}`,
+      `From: ${senderDisplay(msg.sender ?? "", numberToName)}`,
       `Message: ${text || "(empty)"}`,
       `Pass to agent: ${passToAgent ? "Yes" : "No"}`,
       `Why: ${why}`,
