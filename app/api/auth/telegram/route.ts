@@ -76,7 +76,8 @@ export async function POST(request: NextRequest) {
 
     // TODO: Look up user in database by telegram_id
     // For now, create a simple session
-    const session = await getIronSession<SessionData>(cookies(), {
+    const cookieStore = await cookies();
+    const session = await getIronSession<SessionData>(cookieStore, {
       password: process.env.SESSION_SECRET || 'complex_password_at_least_32_characters_long',
       cookieName: 'bo_session',
       cookieOptions: {
@@ -112,7 +113,8 @@ export async function POST(request: NextRequest) {
 
 export async function GET(request: NextRequest) {
   try {
-    const session = await getIronSession<SessionData>(cookies(), {
+    const cookieStore = await cookies();
+    const session = await getIronSession<SessionData>(cookieStore, {
       password: process.env.SESSION_SECRET || 'complex_password_at_least_32_characters_long',
       cookieName: 'bo_session',
       cookieOptions: {
