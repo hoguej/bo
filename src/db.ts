@@ -575,3 +575,88 @@ export async function dbGetUserTimezone(userId: number): Promise<string> {
   );
   return result.rows[0]?.timezone_iana || "America/New_York";
 }
+
+// Additional functions for compatibility with watch-self
+export async function dbGetPrimaryUserPhone(): Promise<string | undefined> {
+  const pool = getPool();
+  const result = await pool.query('SELECT phone_number FROM users WHERE is_system_admin = TRUE LIMIT 1');
+  return result.rows[0]?.phone_number;
+}
+
+export async function dbGetPhoneNumbersThatCanTriggerAgent(): Promise<string[]> {
+  const pool = getPool();
+  const result = await pool.query('SELECT phone_number FROM users WHERE can_trigger_agent = TRUE');
+  return result.rows.map((r: any) => r.phone_number);
+}
+
+export async function dbHasRepliedToMessage(guid: string): Promise<boolean> {
+  const pool = getPool();
+  const result = await pool.query('SELECT 1 FROM watch_self_replied WHERE guid = $1', [guid]);
+  return result.rows.length > 0;
+}
+
+export async function dbMarkMessageReplied(guid: string): Promise<void> {
+  const pool = getPool();
+  await pool.query('INSERT INTO watch_self_replied (guid, replied_at_utc) VALUES ($1, NOW()) ON CONFLICT (guid) DO NOTHING', [guid]);
+}
+
+export async function dbResolveOwnerToUserId(owner: string): Promise<number | undefined> {
+  const pool = getPool();
+  const result = await pool.query('SELECT id FROM users WHERE phone_number = $1', [owner]);
+  return result.rows[0]?.id;
+}
+
+export async function dbGetOwnerByUserId(userId: number): Promise<string> {
+  const pool = getPool();
+  const result = await pool.query('SELECT phone_number FROM users WHERE id = $1', [userId]);
+  return result.rows[0]?.phone_number || '';
+}
+
+export async function dbGetScheduleState(userId: number): Promise<any> {
+  const pool = getPool();
+  const result = await pool.query('SELECT * FROM schedule_state WHERE user_id = $1', [userId]);
+  return result.rows[0] || null;
+}
+
+export async function dbUpsertScheduleState(userId: number, state: any): Promise<void> {
+  const pool = getPool();
+  await pool.query(`
+    INSERT INTO schedule_state (user_id, last_daily_reminder_utc)
+    VALUES ($1, $2)
+    ON CONFLICT (user_id) DO UPDATE SET last_daily_reminder_utc = $2
+  `, [userId, state.last_daily_reminder_utc]);
+}
+
+export async function dbGetDueReminders(nowIso: string): Promise<any[]> {
+  const pool = getPool();
+  const result = await pool.query(`
+    SELECT * FROM reminders 
+    WHERE fire_at_utc <= $1 AND sent_at_utc IS NULL
+  `, [nowIso]);
+  return result.rows;
+}
+
+export async function dbMarkReminderSentOneOff(id: number): Promise<void> {
+  const pool = getPool();
+  await pool.query('UPDATE reminders SET sent_at_utc = NOW() WHERE id = $1', [id]);
+}
+
+export async function dbAdvanceRecurringReminder(id: number, nextFireAtUtc: string): Promise<void> {
+  const pool = getPool();
+  await pool.query('UPDATE reminders SET next_fire_at_utc = $1, fire_at_utc = $1 WHERE id = $2', [nextFireAtUtc, id]);
+}
+
+export async function dbUpsertGroupChat(chatId: string, name: string, type: string): Promise<void> {
+  const pool = getPool();
+  await pool.query(`
+    INSERT INTO group_chats (chat_id, name, type, family_id)
+    VALUES ($1, $2, $3, 1)
+    ON CONFLICT (chat_id) DO UPDATE SET name = $2, type = $3
+  `, [chatId, name, type]);
+}
+
+export async function dbGetGroupChatByName(name: string): Promise<any> {
+  const pool = getPool();
+  const result = await pool.query('SELECT * FROM group_chats WHERE name = $1 LIMIT 1', [name]);
+  return result.rows[0] || null;
+}
