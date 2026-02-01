@@ -76,8 +76,8 @@ export function normalizeNumberForAccess(sender: string | undefined): string {
  * If no access config exists, returns all registry skill IDs. Otherwise returns
  * the intersection of allowed (from config) and existing (from registry).
  */
-export function getAllowedSkillIdsForOwner(owner: string, allSkillIds: string[]): string[] {
-  const access = loadSkillAccessConfig();
+export async function getAllowedSkillIdsForOwner(owner: string, allSkillIds: string[]): Promise<string[]> {
+  const access = await loadSkillAccessConfig();
   if (!access) return allSkillIds;
   const allowed = owner === "default" ? access.default : (access.byNumber[owner] ?? access.default);
   if (!Array.isArray(allowed)) return allSkillIds;

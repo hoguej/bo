@@ -453,7 +453,7 @@ async function main() {
   // Skill access: use normalized sender number so self-chat from your phone gets your byNumber entry.
   const allSkillIds = registry.skills.map((s) => s.id);
   const accessOwner = normalizeNumberForAccess(fromRaw);
-  const allowedSkillIds = getAllowedSkillIdsForOwner(accessOwner, allSkillIds);
+  const allowedSkillIds = await getAllowedSkillIdsForOwner(accessOwner, allSkillIds);
   const allowedSkills = registry.skills.filter((s) => allowedSkillIds.includes(s.id));
 
   const nameToNumber = getNameToNumber();
