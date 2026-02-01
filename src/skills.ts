@@ -42,8 +42,8 @@ function skillRowToDef(r: SkillRow): SkillDef {
   };
 }
 
-export function loadSkillsRegistry(): SkillsRegistry {
-  const rows = dbGetSkillsRegistry();
+export async function loadSkillsRegistry(): Promise<SkillsRegistry> {
+  const rows = await dbGetSkillsRegistry();
   return {
     version: 1,
     skills: rows.map(skillRowToDef),
@@ -51,9 +51,9 @@ export function loadSkillsRegistry(): SkillsRegistry {
 }
 
 /** Load skills access from DB (migrated from skills/access.json). Returns null if no default row (all skills allowed). */
-export function loadSkillAccessConfig(): SkillAccessConfig | null {
-  const defaultAllowed = dbGetSkillsAccessDefault();
-  const byNumber = dbGetSkillsAccessByNumber();
+export async function loadSkillAccessConfig(): Promise<SkillAccessConfig | null> {
+  const defaultAllowed = await dbGetSkillsAccessDefault();
+  const byNumber = await dbGetSkillsAccessByNumber();
   // If default is empty and no byNumber, treat as "all allowed" (return null for backward compat)
   if (defaultAllowed.length === 0 && Object.keys(byNumber).length === 0) return null;
   return {
@@ -85,8 +85,8 @@ export function getAllowedSkillIdsForOwner(owner: string, allSkillIds: string[])
   return allSkillIds.filter((id) => set.has(id));
 }
 
-export function getSkillById(id: string): SkillDef | undefined {
-  const rows = dbGetSkillsRegistry();
+export async function getSkillById(id: string): Promise<SkillDef | undefined> {
+  const rows = await dbGetSkillsRegistry();
   const row = rows.find((s) => s.id === id);
   return row ? skillRowToDef(row) : undefined;
 }

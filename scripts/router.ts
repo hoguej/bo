@@ -440,7 +440,7 @@ async function main() {
     ? { reminder_triggered: "true", reminder_text: scheduledReminderText || "(reminder)" }
     : {};
 
-  const registry = loadSkillsRegistry();
+  const registry = await loadSkillsRegistry();
   const context = buildContext();
 
   // Separate fact store per sender: self-chat = default; 7404749170 / 6143480678 = their own store.
