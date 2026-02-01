@@ -11,6 +11,7 @@ import {
   dbGetSummary,
   dbSetSummary,
   dbUpsertFact,
+  dbResolveOwnerToUserId,
 } from "./db";
 import { canonicalPhone } from "./phone";
 
