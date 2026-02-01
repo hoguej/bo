@@ -27,6 +27,7 @@ import {
   dbGetUserById,
   dbGetUserIdByTelegramId,
   dbInsertLlmLog,
+  dbResolveOwnerToUserId,
   isReservedFactKey,
 } from "../src/db";
 import {
