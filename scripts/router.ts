@@ -958,18 +958,21 @@ async function main() {
   }
 
   // Optional: run summary step (current_summary + recent_conversations → replace summary).
+  // Fire-and-forget so it doesn't block the response
   const summaryPrompt = loadPrompt("summary");
   if (summaryPrompt) {
-    const currentSummary = await getSummaryForPrompt(owner);
-    const recentAfter = await getRecentMessages(owner, Math.min(maxMessages, 10));
-    const summaryUser = ["current_summary:", currentSummary || "(none)", "", "recent_conversations:", formatConversationForPrompt(recentAfter)].join("\n");
-    try {
-      const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);
-      const newSummary = summaryRaw.trim().slice(0, 2000);
-      if (newSummary) await setSummaryForPrompt(owner, newSummary);
-    } catch (_) {
-      /* ignore */
-    }
+    (async () => {
+      try {
+        const currentSummary = await getSummaryForPrompt(owner);
+        const recentAfter = await getRecentMessages(owner, Math.min(getMaxConversationMessages(), 10));
+        const summaryUser = ["current_summary:", currentSummary || "(none)", "", "recent_conversations:", formatConversationForPrompt(recentAfter)].join("\n");
+        const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);
+        const newSummary = summaryRaw.trim().slice(0, 2000);
+        if (newSummary) await setSummaryForPrompt(owner, newSummary);
+      } catch (e) {
+        console.error("[bo router] Summary step error:", e instanceof Error ? e.message : String(e));
+      }
+    })();
   }
 }
 
