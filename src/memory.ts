@@ -203,15 +203,15 @@ function tokenize(s: string): string[] {
 }
 
 /** Returns all stored facts (for "what do you know about me?" etc.). */
-export async function getAllFacts(opts?: { path?: string }): Fact[] {
+export async function getAllFacts(opts?: { path?: string }): Promise<Fact[]> {
   const path = opts?.path ?? getMemoryPath();
-  return loadMemory(path).facts;
+  return (await loadMemory(path)).facts;
 }
 
-export function getRelevantFacts(prompt: string, opts?: { max?: number; path?: string }): Fact[] {
+export async function getRelevantFacts(prompt: string, opts?: { max?: number; path?: string }): Promise<Fact[]> {
   const max = opts?.max ?? 10;
   const path = opts?.path ?? getMemoryPath();
-  const { facts } = loadMemory(path);
+  const { facts } = await loadMemory(path);
   if (facts.length === 0) return [];
 
   const tokens = new Set(tokenize(prompt));
