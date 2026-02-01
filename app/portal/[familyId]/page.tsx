@@ -1,5 +1,5 @@
-export default function FamilyDashboard({ params }: { params: { familyId: string } }) {
-  const { familyId } = params;
+export default async function FamilyDashboard({ params }: { params: Promise<{ familyId: string }> }) {
+  const { familyId } = await params;
 
   return (
     <div style={{ maxWidth: '1200px', margin: '0 auto', padding: '2rem' }}>
