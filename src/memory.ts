@@ -79,7 +79,7 @@ function pathToOwner(path: string): string {
 }
 
 /** Append one high-level summary sentence (from LLM). Keeps last MAX_SUMMARY_SENTENCES. */
-export function appendSummarySentence(owner: string | undefined, sentence: string): void {
+export async function appendSummarySentence(owner: string | undefined, sentence: string): Promise<void> {
   dbAppendSummarySentence(normalizeOwner(owner), sentence.trim());
 }
 
@@ -89,7 +89,7 @@ export function getSummaryForPrompt(owner: string | undefined): Promise<string> 
 }
 
 /** Replace the full summary with a single string (used by prompt-driven summary step). */
-export function setSummaryForPrompt(owner: string | undefined, fullSummary: string): void {
+export async function setSummaryForPrompt(owner: string | undefined, fullSummary: string): Promise<void> {
   await dbSetSummary(normalizeOwner(owner), fullSummary.trim());
 }
 
@@ -103,7 +103,7 @@ export function getPersonalityPathForOwner(owner: string | undefined): string {
 }
 
 /** Append one or more personality instructions. If the string contains ". " we split and append each part (LLM sometimes returns combined list). Per-user; accumulates up to MAX_PERSONALITY_INSTRUCTIONS. */
-export function appendPersonalityInstruction(owner: string | undefined, instruction: string): void {
+export async function appendPersonalityInstruction(owner: string | undefined, instruction: string): Promise<void> {
   await dbAppendPersonalityInstruction(normalizeOwner(owner), instruction);
 }
 

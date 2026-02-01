@@ -490,7 +490,7 @@ async function main() {
             const payload: Record<string, string> = { sendTo: sendToNumber, sendBody, replyToSender };
             if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
             process.stdout.write(JSON.stringify(payload) + "\n");
-            appendConversation(owner, userMessage, replyToSender);
+            await appendConversation(owner, userMessage, replyToSender);
             return;
           }
         }
@@ -527,9 +527,9 @@ async function main() {
         if (f && typeof f.key === "string" && typeof f.value === "string") {
           if (isReservedFactKey(f.key)) continue;
           if (String(f.key).toLowerCase() === "personality_instruction") {
-            appendPersonalityInstruction(owner, f.value);
+            await appendPersonalityInstruction(owner, f.value);
           } else {
-            upsertFact({ key: f.key, value: f.value, scope: f.scope ?? "user", tags: f.tags ?? [], path: memoryPath });
+            await upsertFact({ key: f.key, value: f.value, scope: f.scope ?? "user", tags: f.tags ?? [], path: memoryPath });
           }
         }
       }
@@ -563,7 +563,7 @@ async function main() {
   } catch (e) {
     logErr("what_to_do parse failed: " + (e instanceof Error ? e.message : String(e)));
     process.stdout.write(randomExcuse());
-    appendConversation(owner, userMessage, randomExcuse());
+    await appendConversation(owner, userMessage, randomExcuse());
     return;
   }
   if (isScheduledReminder) {
@@ -579,7 +579,7 @@ async function main() {
     }
   }
   if (decision.personality_instruction && typeof decision.personality_instruction === "string" && decision.personality_instruction.trim()) {
-    appendPersonalityInstruction(owner, decision.personality_instruction.trim());
+    await appendPersonalityInstruction(owner, decision.personality_instruction.trim());
   }
   logErr(`decision: skill=${decision.skill}`);
 
@@ -637,7 +637,7 @@ async function main() {
     if (recipients.length === 0 || !aiPrompt) {
       logErr("send_to_contact missing recipients or ai_prompt");
       process.stdout.write("I need a contact and what to say.");
-      appendConversation(owner, userMessage, "I need a contact and what to say.");
+      await appendConversation(owner, userMessage, "I need a contact and what to say.");
       return;
     }
 
@@ -693,7 +693,7 @@ async function main() {
 
     if (sent.length === 0) {
       process.stdout.write("Couldn't find any of those contacts.");
-      appendConversation(owner, userMessage, "Couldn't find any of those contacts.");
+      await appendConversation(owner, userMessage, "Couldn't find any of those contacts.");
       return;
     }
 
@@ -723,7 +723,7 @@ async function main() {
       process.stdout.write(JSON.stringify(payload) + "\n");
     }
     
-    appendConversation(owner, userMessage, finalReply);
+    await appendConversation(owner, userMessage, finalReply);
     return;
   } else if (decision.skill === "send_to_group") {
     const groupName = String(decision.group_name ?? "").trim();
@@ -732,7 +732,7 @@ async function main() {
     if (!groupName || !message) {
       logErr("send_to_group missing group_name or message");
       process.stdout.write("I need a group name and message.");
-      appendConversation(owner, userMessage, "I need a group name and message.");
+      await appendConversation(owner, userMessage, "I need a group name and message.");
       return;
     }
 
@@ -741,7 +741,7 @@ async function main() {
     if (!skill) {
       logErr("send_to_group skill not found");
       process.stdout.write("Group messaging is not available.");
-      appendConversation(owner, userMessage, "Group messaging is not available.");
+      await appendConversation(owner, userMessage, "Group messaging is not available.");
       return;
     }
 
@@ -754,7 +754,7 @@ async function main() {
       logErr(`send_to_group skill failed exitCode=${code}`);
       finalReply = "I couldn't send that to the group.";
       process.stdout.write(finalReply);
-      appendConversation(owner, userMessage, finalReply);
+      await appendConversation(owner, userMessage, finalReply);
       return;
     }
 
@@ -777,7 +777,7 @@ async function main() {
     if (!skillHints.send_to_group || !skillHints.group_chat_id) {
       finalReply = skillResponse;
       process.stdout.write(finalReply);
-      appendConversation(owner, userMessage, finalReply);
+      await appendConversation(owner, userMessage, finalReply);
       return;
     }
 
@@ -799,7 +799,7 @@ async function main() {
       replyToSender: skillResponse,
     };
     process.stdout.write(JSON.stringify(payload) + "\n");
-    appendConversation(owner, userMessage, skillResponse);
+    await appendConversation(owner, userMessage, skillResponse);
     return;
   } else {
     const skillId = decision.skill;
@@ -807,13 +807,13 @@ async function main() {
     if (!skill) {
       logErr(`Unknown skill_id: ${skillId}`);
       process.stdout.write(randomExcuse());
-      appendConversation(owner, userMessage, randomExcuse());
+      await appendConversation(owner, userMessage, randomExcuse());
       return;
     }
     if (!allowedSkillIds.includes(skillId)) {
       logErr(`Skill ${skillId} not allowed for this number`);
       process.stdout.write("I don't have that capability for this chat—sorry!");
-      appendConversation(owner, userMessage, "I don't have that capability for this chat—sorry!");
+      await appendConversation(owner, userMessage, "I don't have that capability for this chat—sorry!");
       return;
     }
     const input = decisionToSkillInput(decision);
@@ -826,7 +826,7 @@ async function main() {
       logErr(`Skill failed exitCode=${code} skill=${skill.id} stderr=${(stderr || "(none)").slice(0, 500)}`);
       finalReply = randomExcuse();
       process.stdout.write(finalReply);
-      appendConversation(owner, userMessage, finalReply);
+      await appendConversation(owner, userMessage, finalReply);
       return;
     }
     const rawSkillOutput = stdout || "Done.";
@@ -927,7 +927,7 @@ async function main() {
           if (n.telegramId) payload.sendToTelegramId = n.telegramId;
           process.stdout.write(JSON.stringify(payload) + "\n");
         }
-        appendConversation(owner, userMessage, finalReply);
+        await appendConversation(owner, userMessage, finalReply);
         return;
       }
     }
@@ -938,7 +938,7 @@ async function main() {
     process.stdout.write(JSON.stringify({ response_text: finalReply, suppress_reply: true }) + "\n");
   } else {
     process.stdout.write(finalReply);
-    appendConversation(owner, userMessage, finalReply);
+    await appendConversation(owner, userMessage, finalReply);
   }
 
   // Optional: run summary step (current_summary + recent_conversations → replace summary).
@@ -950,7 +950,7 @@ async function main() {
     try {
       const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);
       const newSummary = summaryRaw.trim().slice(0, 2000);
-      if (newSummary) setSummaryForPrompt(owner, newSummary);
+      if (newSummary) await setSummaryForPrompt(owner, newSummary);
     } catch (_) {
       /* ignore */
     }
