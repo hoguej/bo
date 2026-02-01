@@ -123,7 +123,7 @@ function loadPrompt(relativePath: string): string {
 }
 
 /** Log every request to the AI and every response; traceable to request_id and owner (user). Writes to DB (llm_log) and to file (~/.bo/requests.log or BO_REQUEST_LOG). */
-async function await logPromptResponse(
+async function logPromptResponse(
   requestId: string,
   owner: string,
   step: string,
@@ -209,7 +209,7 @@ function randomExcuse(): string {
   return EXCUSES_ON_ERROR[Math.floor(Math.random() * EXCUSES_ON_ERROR.length)]!;
 }
 
-async function await buildContext() {
+async function buildContext() {
   return {
     channel: "imessage",
     from: getEnv("BO_REQUEST_FROM"),
