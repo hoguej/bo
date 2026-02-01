@@ -85,7 +85,6 @@ export async function appendSummarySentence(owner: string | undefined, sentence:
 
 /** Get the running summary for prompt context (oldest first). */
 export async function getSummaryForPrompt(owner: string | undefined): Promise<string> {
-  const { dbGetSummary, dbResolveOwnerToUserId } = await import("./db");
   const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
   if (!userId) return "";
   return await dbGetSummary(userId, 1); // default familyId = 1
@@ -112,7 +111,6 @@ export async function appendPersonalityInstruction(owner: string | undefined, in
 
 /** Get personality instructions for this user for prompt context. */
 export async function getPersonalityForPrompt(owner: string | undefined): Promise<string> {
-  const { dbGetPersonality, dbResolveOwnerToUserId } = await import("./db");
   const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
   if (!userId) return "";
   return await dbGetPersonality(userId, 1); // default familyId = 1
@@ -131,7 +129,6 @@ const MAX_CONVERSATION_MESSAGES = getMaxConversationMessages();
 
 /** Last N messages (oldest first) for context. */
 export async function getRecentMessages(owner: string | undefined, max: number = MAX_CONVERSATION_MESSAGES): Promise<ConversationMessage[]> {
-  const { dbGetConversation, dbResolveOwnerToUserId } = await import("./db");
   const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
   if (!userId) return [];
   const rows = await dbGetConversation(userId, 1, max); // default familyId = 1
@@ -144,7 +141,6 @@ export async function appendConversation(
   userContent: string,
   assistantContent: string
 ): Promise<void> {
-  const { dbAppendConversation, dbResolveOwnerToUserId } = await import("./db");
   const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
   if (!userId) return;
   await dbAppendConversation(userId, 1, userContent, assistantContent, getMaxConversationMessages()); // default familyId = 1
@@ -156,7 +152,6 @@ export function getMemoryPath(): string {
 
 /** Load facts from DB for the owner implied by path. Used by getRelevantFacts/getAllFacts etc. */
 export async function loadMemory(path: string = getMemoryPath()): Promise<MemoryFile> {
-  const { dbGetFacts, dbResolveOwnerToUserId } = await import("./db");
   const owner = pathToOwner(path);
   const userId = await dbResolveOwnerToUserId(owner);
   if (!userId) return { version: 1, facts: [] };
@@ -194,7 +189,6 @@ export async function upsertFact(opts: {
   tags?: string[];
   path?: string;
 }): Promise<Fact> {
-  const { dbUpsertFact, dbResolveOwnerToUserId } = await import("./db");
   const owner = pathToOwner(opts.path ?? getMemoryPath());
   const userId = await dbResolveOwnerToUserId(owner);
   if (!userId) throw new Error("Unable to resolve owner to userId");
@@ -209,7 +203,6 @@ export async function upsertFact(opts: {
 }
 
 export async function deleteFact(opts: { key: string; scope?: FactScope; path?: string }): Promise<boolean> {
-  const { dbDeleteFact, dbResolveOwnerToUserId } = await import("./db");
   const owner = pathToOwner(opts.path ?? getMemoryPath());
   const userId = await dbResolveOwnerToUserId(owner);
   if (!userId) return false;
