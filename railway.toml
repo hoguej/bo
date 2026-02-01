@@ -7,7 +7,5 @@ buildCommand = "bun install"
 
 [deploy]
 startCommand = "bun run src/commands/watch-self.ts"
-healthcheckPath = "/health"
-healthcheckTimeout = 300
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 10
