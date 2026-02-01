@@ -48,23 +48,25 @@ Examples:
   }
 
   try {
-    const sdk = getSdk();
+    // For watch-self, we don't need iMessage SDK (Telegram-only mode)
+    const needsSdk = !["watch-self", "remember", "forget", "facts", "skills"].includes(cmd);
+    const sdk = needsSdk ? getSdk() : null;
 
     switch (cmd) {
       case "get-messages":
-        await runGetMessages(sdk, args);
+        await runGetMessages(sdk!, args);
         break;
       case "send-self":
-        await runSendSelf(sdk, args);
+        await runSendSelf(sdk!, args);
         break;
       case "list-chats":
-        await runListChats(sdk, args);
+        await runListChats(sdk!, args);
         break;
       case "react":
-        await runReact(sdk, args);
+        await runReact(sdk!, args);
         break;
       case "watch-self":
-        await runWatchSelf(sdk, args);
+        await runWatchSelf(sdk as any, args);
         break;
       case "remember":
         await runRemember(args);
