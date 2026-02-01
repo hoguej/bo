@@ -84,7 +84,7 @@ export async function appendSummarySentence(owner: string | undefined, sentence:
 }
 
 /** Get the running summary for prompt context (oldest first). */
-export function getSummaryForPrompt(owner: string | undefined): Promise<string> {
+export async function getSummaryForPrompt(owner: string | undefined): Promise<string> {
   return await dbGetSummary(normalizeOwner(owner));
 }
 
@@ -108,7 +108,7 @@ export async function appendPersonalityInstruction(owner: string | undefined, in
 }
 
 /** Get personality instructions for this user for prompt context. */
-export function getPersonalityForPrompt(owner: string | undefined): Promise<string> {
+export async function getPersonalityForPrompt(owner: string | undefined): Promise<string> {
   return await dbGetPersonality(normalizeOwner(owner));
 }
 
@@ -124,13 +124,13 @@ export function getMaxConversationMessages(): number {
 const MAX_CONVERSATION_MESSAGES = getMaxConversationMessages();
 
 /** Last N messages (oldest first) for context. */
-export function getRecentMessages(owner: string | undefined, max: number = MAX_CONVERSATION_MESSAGES): ConversationMessage[] {
+export async function getRecentMessages(owner: string | undefined, max: number = MAX_CONVERSATION_MESSAGES): ConversationMessage[] {
   const rows = await dbGetConversation(normalizeOwner(owner), max);
   return rows.map((r) => ({ role: r.role as "user" | "assistant", content: r.content }));
 }
 
 /** Append one user and one assistant message, then trim to MAX_CONVERSATION_MESSAGES. Keeps last N messages (both user and Bo's responses) for context. */
-export function appendConversation(
+export async function appendConversation(
   owner: string | undefined,
   userContent: string,
   assistantContent: string
@@ -143,7 +143,7 @@ export function getMemoryPath(): string {
 }
 
 /** Load facts from DB for the owner implied by path. Used by getRelevantFacts/getAllFacts etc. */
-export function loadMemory(path: string = getMemoryPath()): MemoryFile {
+export async function loadMemory(path: string = getMemoryPath()): MemoryFile {
   const owner = pathToOwner(path);
   const factRows = await dbGetFacts(owner);
   const facts: Fact[] = factRows.map((r) => ({
@@ -171,7 +171,7 @@ function normalizeTag(s: string): string {
   return s.trim().toLowerCase();
 }
 
-export function upsertFact(opts: {
+export async function upsertFact(opts: {
   key: string;
   value: string;
   scope?: FactScope;
@@ -203,7 +203,7 @@ function tokenize(s: string): string[] {
 }
 
 /** Returns all stored facts (for "what do you know about me?" etc.). */
-export function getAllFacts(opts?: { path?: string }): Fact[] {
+export async function getAllFacts(opts?: { path?: string }): Fact[] {
   const path = opts?.path ?? getMemoryPath();
   return loadMemory(path).facts;
 }
