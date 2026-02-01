@@ -123,13 +123,13 @@ function loadPrompt(relativePath: string): string {
 }
 
 /** Log every request to the AI and every response; traceable to request_id and owner (user). Writes to DB (llm_log) and to file (~/.bo/requests.log or BO_REQUEST_LOG). */
-function logPromptResponse(
+async function logPromptResponse(
   requestId: string,
   owner: string,
   step: string,
   requestDoc: unknown,
   rawResponse: string
-): void {
+): Promise<void> {
   try {
     await dbInsertLlmLog(requestId, owner ?? "default", step, requestDoc, rawResponse ?? "");
   } catch (e) {
@@ -209,14 +209,14 @@ function randomExcuse(): string {
   return EXCUSES_ON_ERROR[Math.floor(Math.random() * EXCUSES_ON_ERROR.length)]!;
 }
 
-function buildContext() {
+async function buildContext() {
   return {
     channel: "imessage",
     from: getEnv("BO_REQUEST_FROM"),
     to: getEnv("BO_REQUEST_TO"),
     isSelfChat: getEnv("BO_REQUEST_IS_SELF_CHAT"),
     isFromMe: getEnv("BO_REQUEST_IS_FROM_ME"),
-    default_zip: await dbGetConfig("default_zip") || getEnv("BO_DEFAULT_ZIP") || undefined,
+    default_zip: (await dbGetConfig("default_zip")) || getEnv("BO_DEFAULT_ZIP") || undefined,
   };
 }
 
