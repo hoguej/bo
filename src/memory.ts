@@ -155,9 +155,13 @@ export function getMemoryPath(): string {
 }
 
 /** Load facts from DB for the owner implied by path. Used by getRelevantFacts/getAllFacts etc. */
-export async function loadMemory(path: string = getMemoryPath()): MemoryFile {
+export async function loadMemory(path: string = getMemoryPath()): Promise<MemoryFile> {
+  const { dbGetFacts, dbResolveOwnerToUserId } = await import("./db");
   const owner = pathToOwner(path);
-  const factRows = await dbGetFacts(owner);
+  const userId = await dbResolveOwnerToUserId(owner);
+  if (!userId) return { version: 1, facts: [] };
+  
+  const factRows = await dbGetFacts(userId, 1); // default familyId = 1
   const facts: Fact[] = factRows.map((r) => ({
     key: r.key,
     value: r.value,
@@ -189,20 +193,27 @@ export async function upsertFact(opts: {
   scope?: FactScope;
   tags?: string[];
   path?: string;
-}): Fact {
+}): Promise<Fact> {
+  const { dbUpsertFact, dbResolveOwnerToUserId } = await import("./db");
   const owner = pathToOwner(opts.path ?? getMemoryPath());
+  const userId = await dbResolveOwnerToUserId(owner);
+  if (!userId) throw new Error("Unable to resolve owner to userId");
+  
   const key = opts.key.trim();
   const value = opts.value.trim();
   const scope: FactScope = opts.scope ?? "user";
   const tags = (opts.tags ?? []).map(normalizeTag).filter(Boolean);
-  await dbUpsertFact(owner, key, value, scope, tags);
+  await dbUpsertFact(userId, 1, key, value, scope, tags); // default familyId = 1
   const now = new Date().toISOString();
   return { key, value, scope, tags, createdAt: now, updatedAt: now };
 }
 
-export function deleteFact(opts: { key: string; scope?: FactScope; path?: string }): boolean {
+export async function deleteFact(opts: { key: string; scope?: FactScope; path?: string }): Promise<boolean> {
+  const { dbDeleteFact, dbResolveOwnerToUserId } = await import("./db");
   const owner = pathToOwner(opts.path ?? getMemoryPath());
-  return dbDeleteFact(owner, opts.key.trim(), (opts.scope ?? "user") as FactScope);
+  const userId = await dbResolveOwnerToUserId(owner);
+  if (!userId) return false;
+  return await dbDeleteFact(userId, 1, opts.key.trim(), (opts.scope ?? "user") as FactScope); // default familyId = 1
 }
 
 function tokenize(s: string): string[] {
