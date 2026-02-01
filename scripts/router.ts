@@ -131,7 +131,14 @@ async function logPromptResponse(
   rawResponse: string
 ): Promise<void> {
   try {
-    await dbInsertLlmLog(requestId, owner ?? "default", step, requestDoc, rawResponse ?? "");
+    // Resolve owner to userId for database logging
+    let userId: number | null = null;
+    let familyId: number | null = 1; // default family
+    if (owner && owner.startsWith("telegram:")) {
+      const tid = owner.slice(9);
+      userId = await dbGetUserIdByTelegramId(tid);
+    }
+    await dbInsertLlmLog(requestId, userId, familyId, step, requestDoc, rawResponse ?? "");
   } catch (e) {
     console.error("[bo router] Failed to write llm_log:", e instanceof Error ? e.message : String(e));
   }
