@@ -27,6 +27,7 @@ function runRouter(
         ...process.env,
         BO_DB_PATH: DB_PATH,
         BO_PROJECT_ROOT: PROJECT_ROOT,
+        BO_USE_LLM_MOCK: "1",
         BO_LLM_MOCK_PATH: mockPath,
         AI_GATEWAY_API_KEY: "test-key",
         BO_REQUEST_FROM: "default",

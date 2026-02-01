@@ -29,7 +29,7 @@ set -a && source .env.local && set +a && bun test
 
 ## What’s covered
 
-- **Router**: Message → LLM mock → decision → create_response → stdout. Uses `BO_LLM_MOCK_PATH` (no real LLM). Uses `DATABASE_URL` for memory, skills, users.
+- **Router**: Message → LLM mock → decision → create_response → stdout. Uses `BO_USE_LLM_MOCK=1` and `BO_LLM_MOCK_PATH` (no real LLM). Uses `DATABASE_URL` for memory, skills, users.
 - **Watch-self helpers**: `sanitizeReply`, Telegram rate limit, parsing of router stdout.
 - **Integration**: Router run as subprocess (same as watch-self); assert exit 0 and no errors on stdout.
 

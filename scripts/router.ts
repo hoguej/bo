@@ -86,8 +86,14 @@ type LlmMockConfig = {
 
 let llmMockCache: LlmMockConfig | null | undefined;
 
+/** Mock is only used when BO_USE_LLM_MOCK is set (e.g. tests). Dev/daemon never mocks. */
 function loadLlmMock(): LlmMockConfig | null {
   if (llmMockCache !== undefined) return llmMockCache;
+  const useMock = getEnv("BO_USE_LLM_MOCK");
+  if (!useMock || (useMock !== "1" && useMock.toLowerCase() !== "true" && useMock.toLowerCase() !== "yes")) {
+    llmMockCache = null;
+    return null;
+  }
   const mockPath = getEnv("BO_LLM_MOCK_PATH");
   if (!mockPath) {
     llmMockCache = null;
@@ -373,6 +379,361 @@ function decisionToSkillInput(decision: WhatToDoOutput): Record<string, unknown>
   return rest;
 }
 
+// --- OpenAI tools (function calling) path ---
+
+type OpenAIFunctionTool = {
+  type: "function";
+  function: { name: string; description: string; parameters: Record<string, unknown> };
+};
+
+/** Normalize skill inputSchema (plain object or JSON Schema) to OpenAI-compatible parameters. */
+function normalizeInputSchemaToJsonSchema(inputSchema: unknown): Record<string, unknown> {
+  if (inputSchema == null) return { type: "object", properties: {} };
+  if (typeof inputSchema !== "object") return { type: "object", properties: {} };
+  const schema = inputSchema as Record<string, unknown>;
+  if (schema.type === "object" && typeof schema.properties === "object") {
+    return { type: "object", properties: schema.properties, required: schema.required ?? [] };
+  }
+  const properties: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (typeof v === "string" && (v === "string" || v.startsWith("string") || v.includes("optional")))
+      properties[k] = { type: "string", description: String(v) };
+    else if (typeof v === "object" && v !== null) properties[k] = v;
+    else properties[k] = { type: "string" };
+  }
+  return { type: "object", properties, additionalProperties: true };
+}
+
+/** Build OpenAI tool definitions for allowed skills + send_to_contact, send_to_group. create_a_response and friend_mode are direct responses (no tool). */
+function buildOpenAITools(
+  allowedSkills: Array<{ id: string; name: string; description: string; inputSchema: unknown }>,
+  isScheduledReminder: boolean
+): OpenAIFunctionTool[] {
+  const tools: OpenAIFunctionTool[] = [];
+  const skillIds = new Set(allowedSkills.map((s) => s.id));
+  if (skillIds.has("send_to_contact"))
+    tools.push({
+      type: "function",
+      function: {
+        name: "send_to_contact",
+        description: "Send a message to one or more contacts. Use to (single) or to_contacts (array). ai_prompt = what to say to them.",
+        parameters: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient first name (single)" },
+            to_contacts: { type: "array", items: { type: "string" }, description: "Recipient names (multiple)" },
+            ai_prompt: { type: "string", description: "Instructions for the message to generate" },
+          },
+          required: ["ai_prompt"],
+        },
+      },
+    });
+  if (skillIds.has("send_to_group"))
+    tools.push({
+      type: "function",
+      function: {
+        name: "send_to_group",
+        description: "Send a message to a group chat. group_name = e.g. 'Hogue Fam'; message = what to tell the group.",
+        parameters: {
+          type: "object",
+          properties: {
+            group_name: { type: "string" },
+            message: { type: "string" },
+          },
+          required: ["group_name", "message"],
+        },
+      },
+    });
+  for (const s of allowedSkills) {
+    if (s.id === "create_a_response" || s.id === "friend_mode") continue;
+    if (s.id === "send_to_contact" || s.id === "send_to_group") continue;
+    tools.push({
+      type: "function",
+      function: {
+        name: s.id,
+        description: s.description,
+        parameters: normalizeInputSchemaToJsonSchema(s.inputSchema),
+      },
+    });
+  }
+  return tools;
+}
+
+type ToolResult = { result: string; suppressReply?: boolean; payloads?: Array<Record<string, string>> };
+
+type ToolContext = {
+  openai: OpenAI;
+  model: string;
+  requestId: string;
+  owner: string;
+  fromRaw: string | undefined;
+  memoryPath: string;
+  userMessage: string;
+  personalityBlock: string;
+  factsBlock: string;
+  summaryBlock: string;
+  conversationBlock: string;
+  reminderContext: Record<string, string>;
+  allowedSkillIds: string[];
+  logErr: (msg: string) => void;
+  numberToName: Map<string, string>;
+};
+
+/** Execute one tool by name with given args. Returns result string and optional payloads (for send_to_contact/send_to_group/todo notifications). Runs I/O in parallel where possible. */
+async function executeTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  const { openai, model, requestId, owner, fromRaw, memoryPath, userMessage, personalityBlock, factsBlock, summaryBlock, conversationBlock, reminderContext, allowedSkillIds, logErr, numberToName } = ctx;
+  const maxMessages = getMaxConversationMessages() - 1;
+
+  if (name === "send_to_contact") {
+    const to = String(args.to ?? "").trim();
+    const toContacts = Array.isArray(args.to_contacts) ? (args.to_contacts as string[]) : undefined;
+    const aiPrompt = String(args.ai_prompt ?? "").trim();
+    const recipients = toContacts?.length ? toContacts : (to ? [to] : []);
+    if (!recipients.length || !aiPrompt) {
+      return { result: "I need a contact and what to say." };
+    }
+    let from: string;
+    if (owner.startsWith("telegram:")) {
+      const tid = owner.slice(9).trim();
+      const uid = tid ? await dbGetUserIdByTelegramId(tid) : undefined;
+      if (uid != null) {
+        const u = await dbGetUserById(uid);
+        const first = (u?.first_name ?? "").trim();
+        const contactName = u?.phone_number ? numberToName.get(u.phone_number) : undefined;
+        from = first || (contactName ? contactName.split(/\s+/)[0] : undefined) || contactName || "Bo";
+      } else from = "Bo";
+    } else {
+      from = numberToName.get(owner) ? numberToName.get(owner)!.split(/\s+/)[0]! : (owner === "default" ? "Bo" : "Bo");
+    }
+    const recipientPrompt = loadPrompt("skills/send_to_contact_recipient") || "Generate a message to the recipient. The message must say who it is from. Return plain text only.";
+    const recipientJobs = await Promise.all(
+      recipients.map(async (recipientName) => {
+        const sendToNumber = await resolveContactToNumber(recipientName.trim());
+        if (!sendToNumber || sendToNumber.length < 10) return null;
+        const recipientOwner = sendToNumber;
+        const [recipientFacts, recipientConvo, recipientSummary, recipientPersonality] = await Promise.all([
+          getRelevantFacts(aiPrompt, { max: 12, path: getMemoryPathForOwner(recipientOwner) }),
+          getRecentMessages(recipientOwner, maxMessages),
+          getSummaryForPrompt(recipientOwner),
+          getPersonalityForPrompt(recipientOwner),
+        ]);
+        const recipientUser = [
+          "from:", from, "to:", recipientName.trim(), "ai_prompt:", aiPrompt,
+          "personality:", recipientPersonality || "(none)",
+          "facts:", formatFactsForPrompt(recipientFacts) || "(none)",
+          "conversation_summary:", recipientSummary || "(none)",
+          "recent_conversations:", formatConversationForPrompt(recipientConvo) || "(none)",
+        ].join("\n");
+        const sendBodyRaw = await callLlmWithPrompt(openai, model, requestId + "_send_" + sendToNumber.slice(-4), recipientOwner, "send_to_contact_recipient", recipientPrompt, recipientUser, 0.3);
+        const sendBody = sendBodyRaw.trim().length > 2000 ? sendBodyRaw.trim().slice(0, 1997) + "..." : sendBodyRaw.trim() || `${from} says: (no message)`;
+        const sendToTelegramId = await dbGetTelegramIdByPhone(sendToNumber);
+        const displayName = numberToName.get(sendToNumber) ?? recipientName.trim();
+        return { number: sendToNumber, name: displayName.split(/\s+/)[0] ?? displayName, body: sendBody, telegramId: sendToTelegramId };
+      })
+    );
+    const sent = recipientJobs.filter((s): s is NonNullable<typeof s> => s !== null);
+    if (!sent.length) return { result: "Couldn't find any of those contacts." };
+    const senderPrompt = loadPrompt("skills/send_to_contact_sender") || "Generate a short ack to the sender (e.g. Okay, sent that to Cara.). Return plain text only.";
+    const toList = sent.map((s) => s.name).join(", ").replace(/, ([^,]+)$/, ", and $1");
+    const senderUser = ["user_message:", userMessage, "to:", toList, "personality:", personalityBlock || "(none)", "facts:", factsBlock || "(none)", "conversation_summary:", summaryBlock || "(none)", "recent_conversations:", conversationBlock || "(none)"].join("\n");
+    const replyToSenderRaw = await callLlmWithPrompt(openai, model, requestId, owner, "send_to_contact_sender", senderPrompt, senderUser, 0.3);
+    const replyToSender = replyToSenderRaw.trim() || `Okay, sent to ${toList}.`;
+    const payloads = sent.map((s, i) => {
+      const p: Record<string, string> = { sendTo: s.number, sendBody: s.body, replyToSender: "" };
+      if (s.telegramId) p.sendToTelegramId = s.telegramId;
+      return p;
+    });
+    return { result: replyToSender, payloads };
+  }
+
+  if (name === "send_to_group") {
+    const groupName = String(args.group_name ?? "").trim();
+    const message = String(args.message ?? "").trim();
+    if (!groupName || !message) return { result: "I need a group name and message." };
+    const skill = await getSkillById("send_to_group");
+    if (!skill) return { result: "Group messaging is not available." };
+    const skillEnv = { BO_REQUEST_ID: requestId, BO_REQUEST_FROM: fromRaw ?? owner };
+    const { stdout, stderr, code } = await callSkill(skill.entrypoint, { group_name: groupName, message }, skillEnv);
+    if (stderr?.trim()) logErr(`send_to_group stderr: ${stderr.trim().slice(0, 500)}`);
+    if (code !== 0) return { result: "I couldn't send that to the group." };
+    let skillResponse: string;
+    let skillHints: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(stdout || "{}") as Record<string, unknown>;
+      if (typeof parsed.response === "string") {
+        skillResponse = parsed.response;
+        if (parsed.hints && typeof parsed.hints === "object") skillHints = parsed.hints as Record<string, unknown>;
+      } else skillResponse = stdout || "Done.";
+    } catch {
+      skillResponse = stdout || "Done.";
+    }
+    if (!skillHints.send_to_group || !skillHints.group_chat_id) return { result: skillResponse };
+    const groupMessagePrompt = loadPrompt("skills/send_to_group_message") || "Generate a message for the group. Return plain text only.";
+    const groupUser = ["sender_name:", fromRaw ?? owner, "message_intent:", message, "personality:", personalityBlock || "(none)", "facts:", factsBlock || "(none)"].join("\n");
+    const groupMessageRaw = await callLlmWithPrompt(openai, model, requestId + "_group", owner, "send_to_group_message", groupMessagePrompt, groupUser, 0.3);
+    const groupMessage = groupMessageRaw.trim() || message;
+    const payload: Record<string, string> = {
+      sendToGroup: String(skillHints.group_chat_id),
+      sendBody: groupMessage,
+      replyToSender: "",
+    };
+    return { result: skillResponse, payloads: [payload] };
+  }
+
+  const skill = await getSkillById(name);
+  if (!skill) return { result: `Unknown skill: ${name}.` };
+  if (!allowedSkillIds.includes(name)) return { result: "I don't have that capability for this chat—sorry!" };
+  const skillEnv = { BO_REQUEST_ID: requestId, BO_REQUEST_FROM: fromRaw ?? owner };
+  const { stdout, stderr, code } = await callSkill(skill.entrypoint, args, skillEnv);
+  if (stderr?.trim()) logErr(`skill ${name} stderr: ${stderr.trim().slice(0, 500)}`);
+  if (code !== 0) return { result: randomExcuse() };
+  let skillResponse: string;
+  let skillHints: Record<string, unknown> = {};
+  try {
+    const parsed = JSON.parse(stdout || "{}") as Record<string, unknown>;
+    if (typeof parsed.response === "string") {
+      skillResponse = parsed.response;
+      if (parsed.hints && typeof parsed.hints === "object") skillHints = parsed.hints as Record<string, unknown>;
+    } else skillResponse = stdout || "Done.";
+  } catch {
+    skillResponse = stdout || "Done.";
+  }
+  const suppressReply = skillHints.suppress_reply === true;
+
+  if (name === "todo" && code === 0) {
+    const forContact = (args.for_contact as string)?.trim();
+    const forContacts = Array.isArray(skillHints.for_contacts) ? (skillHints.for_contacts as string[]) : undefined;
+    const recipients = forContacts?.length ? forContacts : (forContact ? [forContact] : []);
+    if (recipients.length > 0) {
+      let senderName: string;
+      if (owner.startsWith("telegram:")) {
+        const tid = owner.slice(9).trim();
+        const uid = tid ? await dbGetUserIdByTelegramId(tid) : undefined;
+        if (uid != null) {
+          const u = await dbGetUserById(uid);
+          const first = (u?.first_name ?? "").trim();
+          const contactName = u?.phone_number ? numberToName.get(u.phone_number) : undefined;
+          senderName = first || (contactName ? contactName.split(/\s+/)[0] : undefined) || contactName || "Someone";
+        } else senderName = "Someone";
+      } else senderName = numberToName.get(owner) ?? (owner === "default" ? "Someone" : owner);
+      const action = String(args.action ?? "add").toLowerCase();
+      const text = (args.text as string)?.trim();
+      const num = args.number as number | undefined;
+      let baseNotification: string;
+      if (action === "add" && text) baseNotification = `${senderName} added a todo to your list: ${text}`;
+      else if (action === "mark_done" && num != null) baseNotification = `${senderName} marked #${num} done on your list.`;
+      else if (action === "remove" && num != null) baseNotification = `${senderName} removed #${num} from your list.`;
+      else if (action === "edit" && num != null && text) baseNotification = `${senderName} updated #${num} on your list to: ${text}`;
+      else baseNotification = `${senderName} made a change to your todo list.`;
+      const notificationPrompt = loadPrompt("create_response") || "Rephrase for the user in Bo's personality.";
+      const notifJobs = await Promise.all(
+        recipients.map(async (contactName) => {
+          const sendToNumber = await resolveContactToNumber(contactName.trim());
+          if (!sendToNumber) return null;
+          const recipientOwner = sendToNumber;
+          const [recipientFacts, recipientConvo, recipientSummary, recipientPersonality] = await Promise.all([
+            getRelevantFacts(baseNotification, { max: 8, path: getMemoryPathForOwner(recipientOwner) }),
+            getRecentMessages(recipientOwner, 8),
+            getSummaryForPrompt(recipientOwner),
+            getPersonalityForPrompt(recipientOwner),
+          ]);
+          const notificationUser = ["user_message:", baseNotification, "skill_output:", baseNotification, "personality:", recipientPersonality || "(none)", "facts:", formatFactsForPrompt(recipientFacts) || "(none)", "conversation_summary:", recipientSummary || "(none)", "recent_conversations:", formatConversationForPrompt(recipientConvo) || "(none)"].join("\n");
+          const personalizedRaw = await callLlmWithPrompt(openai, model, requestId + "_notif_" + sendToNumber.slice(-4), recipientOwner, "todo_notification", notificationPrompt, notificationUser, 0.3);
+          const body = personalizedRaw.trim() || baseNotification;
+          const sendToTelegramId = await dbGetTelegramIdByPhone(sendToNumber);
+          return { number: sendToNumber, body: body.length > 2000 ? body.slice(0, 1997) + "..." : body, telegramId: sendToTelegramId };
+        })
+      );
+      const notifications = notifJobs.filter((n): n is NonNullable<typeof n> => n !== null);
+      const payloads = notifications.map((n, i) => {
+        const p: Record<string, string> = { sendTo: n.number, sendBody: n.body, replyToSender: "" };
+        if (n.telegramId) p.sendToTelegramId = n.telegramId;
+        return p;
+      });
+      return { result: skillResponse, suppressReply, payloads };
+    }
+  }
+  return { result: skillResponse, suppressReply };
+}
+
+/** Tools-based agent: 1–2 API calls, parallel tool execution. Returns final reply and any send payloads (replyToSender set by caller). */
+async function runToolsAgentLoop(
+  openai: OpenAI,
+  model: string,
+  requestId: string,
+  owner: string,
+  userMessage: string,
+  tools: OpenAIFunctionTool[],
+  ctx: ToolContext,
+  systemContent: string,
+  logErr: (msg: string) => void
+): Promise<{ finalReply: string; suppressReply: boolean; payloads: Array<Record<string, string>> }> {
+  const payloads: Array<Record<string, string>> = [];
+  let suppressReply = false;
+  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    { role: "system", content: systemContent },
+    { role: "user", content: userMessage },
+  ];
+  const requestDoc1 = { model, messages, tools };
+  const completion1 = await openai.chat.completions.create({
+    model,
+    messages,
+    tools: tools as OpenAI.Chat.ChatCompletionTool[],
+    tool_choice: "auto",
+    temperature: 0.3,
+    stream: false,
+  });
+  const msg1 = completion1.choices[0]?.message;
+  const content1 = msg1?.content?.trim() ?? "";
+  const toolCalls = msg1?.tool_calls;
+  await logPromptResponse(requestId, owner, "tools_agent_1", requestDoc1, content1 + (toolCalls?.length ? `\n[tool_calls: ${toolCalls.length}]` : ""));
+
+  if (!toolCalls || toolCalls.length === 0) {
+    return { finalReply: content1 || "Done.", suppressReply: false, payloads };
+  }
+
+  const toolResults = await Promise.all(
+    toolCalls.map(async (tc) => {
+      const name = tc.function?.name ?? "";
+      let args: Record<string, unknown> = {};
+      try {
+        if (typeof tc.function?.arguments === "string") args = JSON.parse(tc.function.arguments) as Record<string, unknown>;
+      } catch (e) {
+        logErr(`tool ${name} parse args: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      const out = await executeTool(name, args, ctx);
+      if (out.payloads) payloads.push(...out.payloads);
+      if (out.suppressReply) suppressReply = true;
+      return { tool_call_id: tc.id, role: "tool" as const, content: out.result };
+    })
+  );
+
+  messages.push({
+    role: "assistant",
+    content: msg1.content ?? null,
+    tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: "function" as const, function: { name: tc.function?.name ?? "", arguments: tc.function?.arguments ?? "{}" } })),
+  });
+  for (const tr of toolResults) {
+    messages.push({ role: tr.role, tool_call_id: tr.tool_call_id, content: tr.content });
+  }
+  const requestDoc2 = { model, messages, tools };
+  const completion2 = await openai.chat.completions.create({
+    model,
+    messages,
+    tools: tools as OpenAI.Chat.ChatCompletionTool[],
+    tool_choice: "none",
+    temperature: 0.3,
+    stream: false,
+  });
+  const content2 = completion2.choices[0]?.message?.content?.trim() ?? "";
+  await logPromptResponse(requestId, owner, "tools_agent_2", requestDoc2, content2);
+  return { finalReply: content2 || "Done.", suppressReply, payloads };
+}
+
 /** Create response step: load create_response.md, call LLM with user message, skill output, hints, personality, facts, summary, recent conversations; return reply string. */
 async function createResponseStep(
   openai: OpenAI,
@@ -530,7 +891,22 @@ async function main() {
   const contactsList = await getContactsList();
   const contactNames = contactsList.length > 0 ? contactsList.map((c) => c.name).join(", ") : "(none)";
 
+  const syntheticSkills: Array<{ id: string; name: string; description: string; inputSchema: unknown }> = [];
+  if (!allowedSkills.some((s) => s.id === "create_a_response")) syntheticSkills.push({ id: "create_a_response", name: "Reply to user", description: "General chat or reply", inputSchema: {} });
+  if (!isScheduledReminder && !allowedSkills.some((s) => s.id === "friend_mode"))
+    syntheticSkills.push({
+      id: "friend_mode",
+      name: "Friend mode",
+      description: "Have a supportive, friendly conversation (good listener). Use when the user is just talking, venting, sharing feelings, or wants connection—not asking for tasks.",
+      inputSchema: { person: "string (optional; tailor friend mode to a named person)" },
+    });
+  if (!allowedSkills.some((s) => s.id === "send_to_contact")) syntheticSkills.push({ id: "send_to_contact", name: "Send to contact", description: "Send a message to a contact (from, to, ai_prompt)", inputSchema: { from: "string", to: "string", ai_prompt: "string" } });
+  const skillsForPrompt = [...syntheticSkills, ...skillsSummary];
+
   const openai = new OpenAI({ apiKey, baseURL: "https://ai-gateway.vercel.sh/v1" });
+
+  let finalReply: string = "";
+  let suppressReply = false;
 
   // Step 1: Fact finding (fire-and-forget - saves for future messages, doesn't affect current response)
   const factFindingPrompt = loadPrompt("fact_finding") || "Extract facts from the user message. Return a JSON array of { key, value, scope?, tags? }. Empty array [] if none. Only attributes about the user; no meeting/todo/request content.";
@@ -559,19 +935,9 @@ async function main() {
     })();
   }
 
-  // Step 2: What to do
+  // Step 2: What to do (legacy path when BO_LLM_MOCK_PATH is set) or tools-based agent
+  if (loadLlmMock()) {
   const whatToDoPrompt = loadPrompt("what_to_do") || "Choose exactly one skill and its parameters. Return a single JSON object: { skill: string, ...params }. Use skill create_a_response for general chat. Use skill send_to_contact with from, to, ai_prompt when sending to a contact.";
-  const syntheticSkills: Array<{ id: string; name: string; description: string; inputSchema: unknown }> = [];
-  if (!allowedSkills.some((s) => s.id === "create_a_response")) syntheticSkills.push({ id: "create_a_response", name: "Reply to user", description: "General chat or reply", inputSchema: {} });
-  if (!isScheduledReminder && !allowedSkills.some((s) => s.id === "friend_mode"))
-    syntheticSkills.push({
-      id: "friend_mode",
-      name: "Friend mode",
-      description: "Have a supportive, friendly conversation (good listener). Use when the user is just talking, venting, sharing feelings, or wants connection—not asking for tasks.",
-      inputSchema: { person: "string (optional; tailor friend mode to a named person)" },
-    });
-  if (!allowedSkills.some((s) => s.id === "send_to_contact")) syntheticSkills.push({ id: "send_to_contact", name: "Send to contact", description: "Send a message to a contact (from, to, ai_prompt)", inputSchema: { from: "string", to: "string", ai_prompt: "string" } });
-  const skillsForPrompt = [...syntheticSkills, ...skillsSummary];
   const whatToDoUser = ["user_message:", userMessage, "skills:", JSON.stringify(skillsForPrompt), "context:", JSON.stringify(context), "contacts:", contactNames].join("\n");
   const whatToDoRaw = await callLlmWithPrompt(openai, model, requestId, owner, "what_to_do", whatToDoPrompt, whatToDoUser, 0.1);
   const decisionJson = extractJsonObject(whatToDoRaw);
@@ -604,9 +970,6 @@ async function main() {
     await appendPersonalityInstruction(owner, decision.personality_instruction.trim());
   }
   logErr(`decision: skill=${decision.skill}`);
-
-  let finalReply: string;
-  let suppressReply = false;
 
   if (decision.skill === "friend_mode") {
     function normalizeFriendKey(s: string): string | undefined {
@@ -953,6 +1316,51 @@ async function main() {
         return;
       }
     }
+  }
+  } else {
+    const tools = buildOpenAITools(skillsForPrompt, isScheduledReminder);
+    const toolsSystemContent = [
+      "You are Bo, an iMessage assistant. Be witty, playful, and encouraging.",
+      "Either respond directly (for general chat or friend/support mode) or call exactly one tool for actions (todo, reminder, weather, send_to_contact, etc.).",
+      "If you call a tool, you will get the result and must reply to the user in your personality.",
+      "",
+      "personality:", personalityBlock || "(none)",
+      "facts:", factsBlock || "(none)",
+      "conversation_summary:", summaryBlock || "(none)",
+      "recent_conversations:", conversationBlock || "(none)",
+      "contacts:", contactNames,
+      ...(reminderContext.reminder_triggered ? ["", "reminder_triggered: " + reminderContext.reminder_triggered, "reminder_text: " + (reminderContext.reminder_text || "")] : []),
+    ].join("\n");
+    const ctx: ToolContext = { openai, model, requestId, owner, fromRaw, memoryPath, userMessage, personalityBlock, factsBlock, summaryBlock, conversationBlock, reminderContext, allowedSkillIds, logErr, numberToName };
+    const { finalReply: toolsFinalReply, suppressReply: toolsSuppressReply, payloads } = await runToolsAgentLoop(openai, model, requestId, owner, userMessage, tools, ctx, toolsSystemContent, logErr);
+    if (payloads.length > 0) {
+      const last = payloads[payloads.length - 1];
+      if (last) last.replyToSender = toolsFinalReply;
+      for (const p of payloads) process.stdout.write(JSON.stringify(p) + "\n");
+    } else {
+      const out = toolsFinalReply.length > 2000 ? toolsFinalReply.slice(0, 1997) + "..." : toolsFinalReply;
+      if (toolsSuppressReply) process.stdout.write(JSON.stringify({ response_text: out, suppress_reply: true }) + "\n");
+      else process.stdout.write(out);
+    }
+    await appendConversation(owner, userMessage, toolsFinalReply);
+    const summaryPrompt = loadPrompt("summary");
+    if (summaryPrompt) {
+      (async () => {
+        try {
+          const currentSummary = await getSummaryForPrompt(owner);
+          const recentAfter = await getRecentMessages(owner, Math.min(getMaxConversationMessages(), 10));
+          const summaryUser = ["current_summary:", currentSummary || "(none)", "", "recent_conversations:", formatConversationForPrompt(recentAfter)].join("\n");
+          const summaryRaw = await callLlmWithPrompt(openai, model, requestId, owner, "summary", summaryPrompt, summaryUser, 0.2);
+          const newSummary = typeof summaryRaw === "string" ? summaryRaw.trim().slice(0, 2000) : "";
+          if (newSummary) await setSummaryForPrompt(owner, newSummary);
+        } catch (e) {
+          console.error("[bo router] Summary step error:", e instanceof Error ? e.message : String(e));
+        } finally {
+          await closeDb();
+        }
+      })();
+    }
+    return;
   }
 
   if (finalReply.length > 2000) finalReply = finalReply.slice(0, 1997) + "...";

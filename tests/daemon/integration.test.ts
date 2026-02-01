@@ -77,6 +77,7 @@ describe("daemon integration (router subprocess)", () => {
     const env: Record<string, string> = {
       DATABASE_URL,
       AI_GATEWAY_API_KEY: "dummy",
+      BO_USE_LLM_MOCK: "1",
       BO_LLM_MOCK_PATH: FIXTURE_MOCK,
       BO_REQUEST_ID: "test-req-1",
       BO_REQUEST_FROM: `telegram:${testTelegramId}`,
@@ -99,6 +100,7 @@ describe("daemon integration (router subprocess)", () => {
     const env: Record<string, string> = {
       DATABASE_URL,
       AI_GATEWAY_API_KEY: "dummy",
+      BO_USE_LLM_MOCK: "1",
       BO_LLM_MOCK_PATH: FIXTURE_MOCK,
       BO_REQUEST_FROM: "telegram:999999999999",
       BO_REQUEST_TO: "telegram",

@@ -74,6 +74,7 @@ describe("daemon router", () => {
   it("exits with clear message when AI_GATEWAY_API_KEY is missing", async () => {
     const env: Record<string, string> = {
       AI_GATEWAY_API_KEY: "",
+      BO_USE_LLM_MOCK: "",
       BO_LLM_MOCK_PATH: "",
       BO_REQUEST_FROM: "telegram:12345",
       BO_REQUEST_TO: "telegram",
@@ -93,6 +94,7 @@ describe("daemon router", () => {
     const env: Record<string, string> = {
       DATABASE_URL,
       AI_GATEWAY_API_KEY: "dummy",
+      BO_USE_LLM_MOCK: "1",
       BO_LLM_MOCK_PATH: FIXTURE_MOCK,
       BO_REQUEST_FROM: "telegram:12345",
     };
@@ -115,6 +117,7 @@ describe("daemon router", () => {
     const env: Record<string, string> = {
       DATABASE_URL,
       AI_GATEWAY_API_KEY: "dummy",
+      BO_USE_LLM_MOCK: "1",
       BO_LLM_MOCK_PATH: FIXTURE_MOCK,
       BO_REQUEST_FROM: `telegram:${testTelegramId}`,
       BO_REQUEST_TO: "telegram",
@@ -156,6 +159,7 @@ describe("daemon router", () => {
     const env: Record<string, string> = {
       DATABASE_URL: DATABASE_URL!,
       AI_GATEWAY_API_KEY: "dummy",
+      BO_USE_LLM_MOCK: "1",
       BO_LLM_MOCK_PATH: mockPath,
       BO_REQUEST_FROM: `telegram:${testTelegramId}`,
       BO_REQUEST_TO: "telegram",
@@ -176,6 +180,7 @@ describe("daemon router", () => {
     const env: Record<string, string> = {
       DATABASE_URL,
       AI_GATEWAY_API_KEY: "dummy",
+      BO_USE_LLM_MOCK: "1",
       BO_LLM_MOCK_PATH: FIXTURE_MOCK,
       BO_REQUEST_FROM: `telegram:${testTelegramId}`,
       BO_REQUEST_TO: "telegram",

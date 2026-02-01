@@ -6,15 +6,33 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["bun-types"],
-    "lib": ["ESNext", "dom", "dom.iterable"],
+    "types": [
+      "bun-types"
+    ],
+    "lib": [
+      "ESNext",
+      "dom",
+      "dom.iterable"
+    ],
     "jsx": "preserve",
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "incremental": true,
-    "plugins": [{ "name": "next" }]
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "allowJs": true
   },
-  "include": ["src/**/*", "app/**/*", ".next/types/**/*.ts"],
-  "exclude": ["node_modules", "src/commands"]
+  "include": [
+    "src/**/*",
+    "app/**/*",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "src/commands"
+  ]
 }
