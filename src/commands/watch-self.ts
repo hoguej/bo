@@ -352,17 +352,17 @@ function createTelegramBot(): Bot | null {
   return bot;
 }
 
-function runAgent(message: string, ctxEnv: Record<string, string>): Promise<{ stdout: string; stderr: string; code: number }> {
+async function runAgent(message: string, ctxEnv: Record<string, string>): Promise<{ stdout: string; stderr: string; code: number }> {
+  const script = await getAgentScript();
+  if (!script) {
+    return {
+      stdout: "",
+      stderr: "Set config agent_script in admin or BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.",
+      code: 1,
+    };
+  }
+
   return new Promise((resolve) => {
-    const script = await getAgentScript();
-    if (!script) {
-      resolve({
-        stdout: "",
-        stderr: "Set config agent_script in admin or BO_AGENT_SCRIPT to a script that accepts the message as first arg and prints the response.",
-        code: 1,
-      });
-      return;
-    }
     // Don't use shell: true—apostrophes etc. in the message would break the command. Pass args directly.
     const proc = spawn("/bin/bash", [script, message], {
       shell: false,
