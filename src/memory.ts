@@ -85,7 +85,10 @@ export async function appendSummarySentence(owner: string | undefined, sentence:
 
 /** Get the running summary for prompt context (oldest first). */
 export async function getSummaryForPrompt(owner: string | undefined): Promise<string> {
-  return await dbGetSummary(normalizeOwner(owner));
+  const { dbGetSummary, dbResolveOwnerToUserId } = await import("./db");
+  const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
+  if (!userId) return "";
+  return await dbGetSummary(userId, 1); // default familyId = 1
 }
 
 /** Replace the full summary with a single string (used by prompt-driven summary step). */
@@ -109,7 +112,10 @@ export async function appendPersonalityInstruction(owner: string | undefined, in
 
 /** Get personality instructions for this user for prompt context. */
 export async function getPersonalityForPrompt(owner: string | undefined): Promise<string> {
-  return await dbGetPersonality(normalizeOwner(owner));
+  const { dbGetPersonality, dbResolveOwnerToUserId } = await import("./db");
+  const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
+  if (!userId) return "";
+  return await dbGetPersonality(userId, 1); // default familyId = 1
 }
 
 export type ConversationMessage = { role: "user" | "assistant"; content: string };
@@ -124,8 +130,11 @@ export function getMaxConversationMessages(): number {
 const MAX_CONVERSATION_MESSAGES = getMaxConversationMessages();
 
 /** Last N messages (oldest first) for context. */
-export async function getRecentMessages(owner: string | undefined, max: number = MAX_CONVERSATION_MESSAGES): ConversationMessage[] {
-  const rows = await dbGetConversation(normalizeOwner(owner), max);
+export async function getRecentMessages(owner: string | undefined, max: number = MAX_CONVERSATION_MESSAGES): Promise<ConversationMessage[]> {
+  const { dbGetConversation, dbResolveOwnerToUserId } = await import("./db");
+  const userId = await dbResolveOwnerToUserId(normalizeOwner(owner));
+  if (!userId) return [];
+  const rows = await dbGetConversation(userId, 1, max); // default familyId = 1
   return rows.map((r) => ({ role: r.role as "user" | "assistant", content: r.content }));
 }
 
