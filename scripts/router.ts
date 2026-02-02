@@ -37,6 +37,13 @@ import {
   loadSkillsRegistry,
   normalizeNumberForAccess,
 } from "../src/skills";
+import {
+  classifyMessage,
+  getMoodForPrompt,
+  onRequestError,
+  onRequestStart,
+  onRequestSuccess,
+} from "../src/mood";
 
 /** Fact = persistent attribute about the user (stated or inferred). Inferences (e.g. Cara is female, Cara is Carrie's daughter) are stored in the same facts table. Not meeting/todo/request content. */
 type FactInput = { key: string; value: string; scope?: "user" | "global"; tags?: string[] };
@@ -810,6 +817,11 @@ async function main() {
     ? { reminder_triggered: "true", reminder_text: scheduledReminderText || "(reminder)" }
     : {};
 
+  const moodState = onRequestStart(userMessage);
+  const moodBlock = getMoodForPrompt(moodState);
+  const boPersonalityBlock = loadPrompt("bo_personality") || "";
+  const baseExtraContext: Record<string, string> = { mood: moodBlock, bo_personality: boPersonalityBlock };
+
   const registry = await loadSkillsRegistry();
   const context = await buildContext();
 
@@ -860,6 +872,7 @@ async function main() {
             const payload: Record<string, string> = { sendTo: sendToNumber, sendBody, replyToSender };
             if (sendToTelegramId) payload.sendToTelegramId = sendToTelegramId;
             process.stdout.write(JSON.stringify(payload) + "\n");
+            onRequestSuccess(classifyMessage(userMessage) === "compliment");
             await appendConversation(owner, userMessage, replyToSender);
             return;
           }
@@ -1007,12 +1020,13 @@ async function main() {
       { mode: "friend_mode", person: friendKey ?? null },
       memoryPath,
       {
+        ...baseExtraContext,
         friend_mode_generic_prompt: genericFriendPrompt || "(none)",
         friend_mode_person_prompt: personalFriendPrompt || "(none)",
       }
     );
   } else if (decision.skill === "create_a_response") {
-    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, "", {}, memoryPath, reminderContext);
+    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, "", {}, memoryPath, { ...baseExtraContext, ...reminderContext });
   } else if (decision.skill === "send_to_contact") {
     const to = String(decision.to ?? "").trim();
     const toContacts = Array.isArray((decision as Record<string, unknown>).to_contacts) ? ((decision as Record<string, unknown>).to_contacts as string[]) : undefined;
@@ -1107,7 +1121,7 @@ async function main() {
       if (s.telegramId) payload.sendToTelegramId = s.telegramId;
       process.stdout.write(JSON.stringify(payload) + "\n");
     }
-    
+    onRequestSuccess(classifyMessage(userMessage) === "compliment");
     await appendConversation(owner, userMessage, finalReply);
     return;
   } else if (decision.skill === "send_to_group") {
@@ -1184,6 +1198,7 @@ async function main() {
       replyToSender: skillResponse,
     };
     process.stdout.write(JSON.stringify(payload) + "\n");
+    onRequestSuccess(classifyMessage(userMessage) === "compliment");
     await appendConversation(owner, userMessage, skillResponse);
     return;
   } else {
@@ -1229,7 +1244,7 @@ async function main() {
       skillResponse = rawSkillOutput;
     }
     if (skillHints.suppress_reply === true) suppressReply = true;
-    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, skillResponse, skillHints, memoryPath, reminderContext);
+    finalReply = await createResponseStep(openai, model, requestId, owner, userMessage, skillResponse, skillHints, memoryPath, { ...baseExtraContext, ...reminderContext });
 
     // When someone modifies another person's todo list, notify that person (or people).
     if (skillId === "todo" && code === 0) {
@@ -1312,6 +1327,7 @@ async function main() {
           if (n.telegramId) payload.sendToTelegramId = n.telegramId;
           process.stdout.write(JSON.stringify(payload) + "\n");
         }
+        onRequestSuccess(classifyMessage(userMessage) === "compliment");
         await appendConversation(owner, userMessage, finalReply);
         return;
       }
@@ -1323,6 +1339,10 @@ async function main() {
       "You are Bo, an iMessage assistant. Be witty, playful, and encouraging.",
       "Either respond directly (for general chat or friend/support mode) or call exactly one tool for actions (todo, reminder, weather, send_to_contact, etc.).",
       "If you call a tool, you will get the result and must reply to the user in your personality.",
+      "",
+      moodBlock,
+      "",
+      "bo_personality:", boPersonalityBlock || "(none)",
       "",
       "personality:", personalityBlock || "(none)",
       "facts:", factsBlock || "(none)",
@@ -1342,6 +1362,7 @@ async function main() {
       if (toolsSuppressReply) process.stdout.write(JSON.stringify({ response_text: out, suppress_reply: true }) + "\n");
       else process.stdout.write(out);
     }
+    onRequestSuccess(classifyMessage(userMessage) === "compliment");
     await appendConversation(owner, userMessage, toolsFinalReply);
     const summaryPrompt = loadPrompt("summary");
     if (summaryPrompt) {
@@ -1363,6 +1384,7 @@ async function main() {
     return;
   }
 
+  onRequestSuccess(classifyMessage(userMessage) === "compliment");
   if (finalReply.length > 2000) finalReply = finalReply.slice(0, 1997) + "...";
   if (suppressReply) {
     process.stdout.write(JSON.stringify({ response_text: finalReply, suppress_reply: true }) + "\n");
@@ -1394,6 +1416,7 @@ async function main() {
 
 main().catch((err) => {
   const reqTag = currentRequestId ? ` [req:${currentRequestId}]` : "";
+  onRequestError();
   console.error(`[bo router]${reqTag} Error: ${err?.message ?? String(err)}`);
   if (err instanceof Error && err.stack) console.error(`[bo router]${reqTag} Stack: ${err.stack}`);
   process.stdout.write(randomExcuse());
