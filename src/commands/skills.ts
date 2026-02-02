@@ -1,7 +1,7 @@
 import { loadSkillsRegistry } from "../skills";
 
 export async function runSkills(_args: string[]): Promise<void> {
-  const reg = loadSkillsRegistry();
+  const reg = await loadSkillsRegistry();
   for (const s of reg.skills) {
     console.log(
       [

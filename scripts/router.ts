@@ -1335,11 +1335,48 @@ async function main() {
   }
   } else {
     const tools = buildOpenAITools(skillsForPrompt, isScheduledReminder);
+    // Check if user has an active 20 Questions game so we force routing follow-ups to the skill.
+    let twentyQuestionsActive = false;
+    if (allowedSkillIds.includes("twenty_questions")) {
+      try {
+        const skill = await getSkillById("twenty_questions");
+        if (skill) {
+          const skillEnv = { BO_REQUEST_ID: requestId, BO_REQUEST_FROM: fromRaw ?? owner };
+          const { stdout, code } = await callSkill(skill.entrypoint, { action: "status" }, skillEnv);
+          if (code === 0 && stdout) {
+            let responseText = "";
+            try {
+              const parsed = JSON.parse(stdout) as { response?: string };
+              responseText = (parsed?.response ?? "").trim();
+            } catch {
+              responseText = stdout.trim();
+            }
+            twentyQuestionsActive = responseText.includes("questions left") && !responseText.includes("No game in progress");
+          }
+        }
+      } catch (e) {
+        logErr("twenty_questions status check: " + (e instanceof Error ? e.message : String(e)));
+      }
+    }
+    const twentyQuestionsBlock = twentyQuestionsActive
+      ? [
+          "CRITICAL — 20 QUESTIONS GAME IN PROGRESS: The user is in an active game right now. You MUST call the twenty_questions tool with their message:",
+          "- If they asked a yes/no question (e.g. \"is it an animal?\", \"does it fly?\") → action \"question\" and question = their exact question.",
+          "- If they guessed the thing (e.g. \"is it a dog?\", \"I think it's pizza\") → action \"guess\" and guess = the thing they said.",
+          "- If they asked how many questions left → action \"status\".",
+          "Do NOT say \"start the game\" or \"let me know if you want to begin\" — the game has already started. Call the tool and then reply using the tool result.",
+          "",
+        ]
+      : [
+          "20 QUESTIONS: When the user wants to play, call twenty_questions with action \"start\". When they ask yes/no questions or guess, use action \"question\" or \"guess\". Reply using the tool result.",
+          "",
+        ];
     const toolsSystemContent = [
       "You are Bo, an iMessage assistant. Be witty, playful, and encouraging.",
       "Either respond directly (for general chat or friend/support mode) or call exactly one tool for actions (todo, reminder, weather, send_to_contact, etc.).",
       "If you call a tool, you will get the result and must reply to the user in your personality.",
       "",
+      ...twentyQuestionsBlock,
       moodBlock,
       "",
       "bo_personality:", boPersonalityBlock || "(none)",

@@ -11,7 +11,7 @@ Choose **exactly one** skill and its parameters. There is no separate "respond" 
 ## Output
 
 Return a **single JSON object** with:
-- `skill` (string): The skill id (e.g. `friend_mode`, `create_a_response`, `send_to_contact`, `weather`, `todo`, `reminder`, `brave`, `google`, `change_personality`).
+- `skill` (string): The skill id (e.g. `friend_mode`, `create_a_response`, `send_to_contact`, `weather`, `todo`, `reminder`, `brave`, `google`, `twenty_questions`, `change_personality`).
 - Plus any parameters required by that skill.
 
 Exactly one skill per response. Parameters must match the skill's schema.
@@ -91,6 +91,21 @@ When user says "set a reminder for X and Y at ..." use `for_contacts` array. Sin
 ### brave, google
 - `query` (string): User's request or search query.
 
+### twenty_questions
+Play 20 Questions: Bo thinks of something; the user asks yes/no questions and tries to guess in 20 or fewer.
+
+- `action`: "start" | "question" | "guess" | "status".
+- **start**: Start a new game. Optional: `category` (string, e.g. "animal", "food", "place"). Use when the user says "let's play 20 questions", "play 20 questions", "start 20 questions", or "think of something [in category]".
+- **question**: The user is asking a yes/no question about the secret. `question` (string): the user's question. Use when the user asks something like "Is it an animal?", "Does it fly?", "Is it bigger than a car?".
+- **guess**: The user is guessing the thing. `guess` (string): the user's guess. Use when the user says "Is it a dog?", "I think it's pizza", "my guess is the Eiffel Tower".
+- **status**: How many questions left. Use when the user asks "how many questions do I have?", "questions left?", etc.
+
+**When to choose twenty_questions:**
+- "Let's play 20 questions", "play 20 questions", "think of something" → **start** (optional `category` if they specify one).
+- During a game, a yes/no question about the thing → **question** with `question`.
+- During a game, a specific guess (naming the thing) → **guess** with `guess`.
+- "How many questions left?", "status" → **status**.
+
 ### change_personality
 - `instruction` (string): e.g. "talk like a pirate".
 
@@ -134,6 +149,26 @@ When user says "set a reminder for X and Y at ..." use `for_contacts` array. Sin
 
 ```json
 { "skill": "reminder", "action": "list" }
+```
+
+```json
+{ "skill": "twenty_questions", "action": "start" }
+```
+
+```json
+{ "skill": "twenty_questions", "action": "start", "category": "animal" }
+```
+
+```json
+{ "skill": "twenty_questions", "action": "question", "question": "Is it bigger than a car?" }
+```
+
+```json
+{ "skill": "twenty_questions", "action": "guess", "guess": "elephant" }
+```
+
+```json
+{ "skill": "twenty_questions", "action": "status" }
 ```
 
 ```json
